@@ -1,0 +1,8 @@
+# Text files are stored and checked out with LF; the build runs on Linux
+# (WSL) and CRLF breaks shell scripts and TOML/DTS parsing.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.bin binary
+*.dtb binary
