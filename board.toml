@@ -32,8 +32,16 @@ fd = "Build/tb365fcPkg/{target}_CLANGPDB/FV/SILICIUM_UEFI.fd"
 submodules = [
   "Common/Mu",
   "Common/Mu_OEM_Sample",
-  "Mu_Basecore",
   "Silicon/Silicium/OpensslPkg/Library/OpensslLib/openssl",
+]
+# Base-core fixes applied to the shared edk2 checkout for the build and
+# reverted afterwards; the Mu_Basecore gitlink itself stays on upstream.
+patches = [
+  "Resources/MuPatches/AsmMacroLib.patch",
+  "Resources/MuPatches/Auth-Service.patch",
+  "Resources/MuPatches/Boot-Manager.patch",
+  "Resources/MuPatches/Timer.patch",
+  "Resources/MuPatches/Usb-Bus.patch",
 ]
 packages = [
   "{uefi}",

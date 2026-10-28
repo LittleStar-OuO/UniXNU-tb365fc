@@ -1,8 +1,8 @@
-# The MT6835 shared layer. During bring-up the local checkout next to this repository is
-# used; it is never written to unixnu.lock. Before publication, remove local and pin the
-# reviewed commit of the published repository instead.
+# The MT6835 shared layer, pinned to the published repository. Workstation
+# overrides live in the git-ignored local.toml and are never written to
+# unixnu.lock.
 [[source]]
 name = "mt6835"
 kind = "soc"
-git = "https://github.com/UniXNU/UniXNU-mt6835-common"
-local = "../UniXNU-mt6835-common"
+git = "https://github.com/LittleStar-OuO/UniXNU-mt6835-common"
+commit = "694324c10be80118a82cbed29bd98ed4e830640e"
