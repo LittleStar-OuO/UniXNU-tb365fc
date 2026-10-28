@@ -37,8 +37,9 @@ repository until those inputs are real.
 | `unixnu.lock` | Resolved source commits written by `unixnu fetch` |
 
 The UEFI firmware lives in a separate `uefi-tb365fc` checkout. The UniXNU
-framework changes the firmware UI needs are kept in a `UniXNU` fork on the
-`tb365fc` branch.
+framework changes the firmware UI needs are kept in a `UniXNU` fork, proposed
+upstream as [pull request #125](https://github.com/UniXNU/UniXNU/pull/125)
+from the `feat/tb365fc-ui` branch.
 
 ## Prerequisites
 
