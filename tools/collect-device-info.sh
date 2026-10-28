@@ -13,6 +13,9 @@
 #   ./collect-device-info.sh --dmesg         # also collect a filtered dmesg
 set -eu
 
+# Git Bash rewrites absolute Unix paths in adb arguments to Windows paths.
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) export MSYS_NO_PATHCONV=1 ;; esac
+
 ADB=(adb)
 OUT=""
 WANT_DMESG=0

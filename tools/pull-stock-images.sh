@@ -12,6 +12,9 @@
 #   ./pull-stock-images.sh -s SERIAL boot
 set -eu
 
+# Git Bash rewrites absolute Unix paths in adb arguments to Windows paths.
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) export MSYS_NO_PATHCONV=1 ;; esac
+
 ADB=(adb)
 OUT="out/stock"
 LIST_ONLY=0
