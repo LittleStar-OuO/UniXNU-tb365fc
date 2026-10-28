@@ -3,7 +3,8 @@
 #
 # Reads build props, kernel command line, CPU/memory info, the partition map and
 # (with root) /proc/iomem and the live FDT. getprop, cmdline, bootconfig, cpuinfo
-# and dmesg outputs are filtered for serials, IMEI/MEID, MACs, Android ID and FRP;
+# and dmesg outputs are filtered for serials, PSN, bootloader SN, IMEI/MEID,
+# MACs, Android ID and FRP;
 # the full unfiltered getprop output is never written to disk.
 #
 # Usage:
@@ -51,7 +52,7 @@ root_shell() { "${ADB[@]}" shell "su -c '$1'" | tr -d '\r'; }
 
 # Redact key=value and key = "value" pairs whose key names a device identifier.
 redact_ids() {
-  sed -E 's/([A-Za-z0-9_.-]*(serial|macaddr|mac_addr|btmacaddr|wifimacaddr|imei|meid|android_id|frp)[A-Za-z0-9_.-]*[[:space:]]*=[[:space:]]*)("[^"]*"|[^[:space:]]+)/\1<redacted>/Ig'
+  sed -E 's/([A-Za-z0-9_.-]*(serial|macaddr|mac_addr|btmacaddr|wifimacaddr|imei|meid|android_id|frp|psn|bootload_sn|bootloader_sn)[A-Za-z0-9_.-]*[[:space:]]*=[[:space:]]*)("[^"]*"|[^[:space:]]+)/\1<redacted>/Ig'
 }
 
 if root_shell id 2>/dev/null | grep -q 'uid=0'; then
@@ -73,7 +74,7 @@ echo "collecting into $OUT (root: $([ "$HAS_ROOT" -eq 1 ] && echo yes || echo no
 } > "$OUT/build-identity.txt"
 
 shell getprop \
-  | grep -viE 'serial|imei|meid|macaddr|mac_addr|bt_mac|wifi_mac|android_id|frp|gsm\.sim|persist\.radio\.imei' \
+  | grep -viE 'serial|imei|meid|macaddr|mac_addr|bt_mac|wifi_mac|android_id|frp|psn|bootload_sn|bootloader_sn|gsm\.sim|persist\.radio\.imei' \
   > "$OUT/props-filtered.txt" || true
 
 shell cat /proc/cmdline | redact_ids > "$OUT/cmdline.txt" 2>/dev/null || true
@@ -103,7 +104,7 @@ if [ "$HAS_ROOT" -eq 1 ]; then
 
   if [ "$WANT_DMESG" -eq 1 ]; then
     root_shell 'dmesg' \
-      | grep -viE 'serial|imei|meid|macaddr|mac_addr|bt_mac|wifi_mac|android_id|frp' \
+      | grep -viE 'serial|imei|meid|macaddr|mac_addr|bt_mac|wifi_mac|android_id|frp|psn|bootload_sn|bootloader_sn' \
       > "$OUT/dmesg-filtered.txt" 2>/dev/null || true
   fi
 fi
