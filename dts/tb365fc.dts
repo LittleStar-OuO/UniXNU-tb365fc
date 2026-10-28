@@ -16,10 +16,10 @@
 	compatible = "lenovo,tb365fc", "mediatek,mt6835";
 
 	/*
-	 * REQUIRED: one contiguous DRAM range. The stock vendor_boot DTB only carries a
-	 * 1 GiB LK placeholder at 0x40000000; the real size must come from /proc/meminfo.
-	 * The 8 GiB range below matches the announced configuration and still needs
-	 * confirmation (the ADT generator accepts exactly one range).
+	 * 8 GiB at 0x40000000, measured on the tablet: MemTotal is 7,991,068 kB and
+	 * /proc/iomem runs from 0x40000000 to 0x23fffffff. The stock vendor_boot DTB
+	 * only carries the 1 GiB LK placeholder. The ADT generator accepts exactly one
+	 * contiguous range; reserved-memory carveouts are declared separately.
 	 */
 	memory@40000000 {
 		device_type = "memory";

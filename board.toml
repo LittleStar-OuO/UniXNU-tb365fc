@@ -51,15 +51,12 @@ packages = [
 DEVICE_MODEL = "TB365FC"
 
 [userdata]
-# REQUIRED: the stock scatter places userdata at byte 0x34C800000 in both its EMMC
-# and UFS layouts. The stock DTB enables ufshci@112b0000 and disables both MSDC hosts,
-# so the storage type and sector size are unsettled; 0x1A64000 assumes 512-byte sectors.
-first_lba = 0x1A64000
-# REQUIRED: the scatter is not the GPT (its pgpt entry is NONE) and its 0xC0000000-byte
-# size is the factory image. Read the real start/end and logical block size from
-# /proc/partitions and the block queue on the tablet.
-last_lba = 0
-lba_bytes = 512
+# Measured from the on-device GPT: the UFS LUN exposes 4096-byte logical sectors and
+# userdata runs from LBA 0x34C800 to 0x1DC8FF7 (111,091,680 KiB). The byte offset
+# matches the stock scatter's 0x34C800000.
+first_lba = 0x34C800
+last_lba = 0x1DC8FF7
+lba_bytes = 4096
 windows = [
   { name = "OS", component = "OS" },
   { name = "SystemOS", component = "Cryptex1,SystemOS" },

@@ -4,7 +4,7 @@ schema_version = 1
 name = "tb365fc"
 soc = "MT6835"
 os_profile = "ipados-17.7.11-21H461"
-summary = "Lenovo Xiaoxin Pad 12.1 (2025), Lenovo TB365FC, board cava_prc_consumer_wifi. The stock ZUXOS 1.1.10.122 package has been unpacked and its boot chain, CPU topology, storage layout and board peripherals are recorded; no hardware milestone is verified yet."
+summary = "Lenovo Xiaoxin Pad 12.1 (2025), Lenovo TB365FC, board cava_prc_consumer_wifi. The stock ZUXOS 1.1.10.122 package is unpacked and the unit itself has been inventoried over rooted adb (8 GB DRAM, 128 GB UFS, 1600x2560 @90 Hz, MT6631 combo); no boot milestone is verified yet."
 
 [[area]]
 id = "configuration"
@@ -14,11 +14,13 @@ paths = ["board.toml", "feeds.toml", "configs/**", "dts/**", ".github/**", ".git
 inputs = ["MT6835 platform identity, Lenovo TB365FC (cava_prc_consumer_wifi) board identity, iPad7,1 / iPadOS 17.7.11 build 21H461 target identity and the TB365FC bootstrap defconfig.", "Stock package ZUXOS 1.1.10.122 (Android 15, build TB365FC_CN_OPEN_USER_M1317.3_V_ZUXOS_1.1.10.122_ST_250828), hashed in proprietary-files.txt."]
 configuration = ["board.soc = MT6835; board.soc_source = mt6835; board.os_profile = ipados-17.7.11-21H461; schema_version = 2.", "tb365fc_defconfig enables the shared ARM DT platform, ARMCPU, architected timer, panic and prelinked crypto paths.", "feeds.toml points at the sibling UniXNU-mt6835-common checkout until a reviewed commit is published."]
 procedure = ["Run ./unixnu defconfig tb365fc_defconfig -D ../UniXNU-tb365fc from a UniXNU checkout.", "Run ./unixnu status --json -D ../UniXNU-tb365fc and inspect the effective SoC layer and source pins."]
-findings = ["The device identifies as MT6835 with stock board name cava_prc_consumer_wifi, Android 15, build TB365FC_CN_OPEN_USER_M1317.3_V_ZUXOS_1.1.10.122_ST_250828.", "The stock SP Flash Tool package provides boot, init_boot, vendor_boot, dtbo, lk and preloader images; their hashes and the values derived from them are recorded across the firmware, cpu, memory, storage, display, input, gpu, network, audio, power and packaging areas.", "No public Lenovo kernel source or DTS for this board was found; every hardware value so far comes from the stock firmware."]
+findings = ["The device identifies as MT6835 with stock board name cava_prc_consumer_wifi, Android 15, build TB365FC_CN_OPEN_USER_M1317.3_V_ZUXOS_1.1.10.122_ST_250828.", "The stock SP Flash Tool package provides boot, init_boot, vendor_boot, dtbo, lk and preloader images; their hashes and the values derived from them are recorded across the firmware, cpu, memory, storage, display, input, gpu, network, audio, power and packaging areas.", "No public Lenovo kernel source or DTS for this board was found; every hardware value so far comes from the stock firmware and the live device inventory.", "The unit reports ro.product.device TB365FC, ro.product.name TB365FC_PRC, ro.board.platform mt6835 and ro.boot.hardware mt8755 on Android 15 build AP3A.240905.015.A2/250828_122 (kernel 5.15.170), with ro.boot.verifiedbootstate orange and ro.boot.flash.locked 0."]
 completion = ["Source pins resolve, the effective configuration contains the intended TB365FC overrides and every selected component has an owning area."]
-limits = ["DRAM size, the userdata end, the Wi-Fi/BT chip identity and the panel resolution are still unverified; the measured boot geometry has not been accepted by this unit's LK yet."]
-next_action = ["Collect the on-device inventory (meminfo, GPT, live FDT) with tools/collect-device-info.sh and replace the remaining REQUIRED values."]
-evidence = []
+limits = ["The active panel variant, the APFS Data volume UUID, the LK acceptance of a self-built boot image and the FD base are still unverified; example stays true until the firmware boots."]
+next_action = ["Build the first UEFI FD, confirm the boot path on hardware and only then clear example = true and fill the remaining REQUIRED values."]
+evidence = [
+  { kind = "device", reference = "tools/collect-device-info.sh", command = "tools/collect-device-info.sh", revision = "5ba47e6284567baa3450f9d82b5d56963cd14035", result = "Collected the redacted identity and hardware inventory that the areas below now cite." },
+]
 
 [[area]]
 id = "firmware"
@@ -28,13 +30,14 @@ paths = ["proprietary-files.txt", "tools/**", "README.md"]
 inputs = ["Stock TB365FC firmware package (Android 15, build TB365FC_CN_OPEN_USER_M1317.3_V_ZUXOS_1.1.10.122_ST_250828), unlocked bootloader state, fastboot mode, the stock boot/vendor_boot/dtbo partitions and the UEFI firmware from uefi-tb365fc.", "Measured boot geometry: boot.img header v4 (4096-byte pages); vendor_boot header v4 with kernel_addr 0x40000000, ramdisk_addr 0x66F00000, tags_addr/dtb_addr 0x47C80000 and cmdline \"bootopt=64S3,32N2,64N2\"."]
 configuration = ["Plan A: LK loads a BootShim/UEFI FD directly at 0x40080000 from a self-built header v2 image; Plan B fallback: Linux preboot hot-jump as documented by camellia.", "Resources/Configs/tb365fc.toml derives base, tags_offset, dtb_offset and ramdisk_offset from the stock vendor_boot header; header_version stays 2 because the stock v4 header carries no load addresses.", "Firmware paths in board.toml [firmware] point at Platforms/Lenovo/tb365fcPkg and Build/tb365fcPkg in the uefi-tb365fc checkout."]
 procedure = ["Extract the stock boot, vendor_boot and dtbo partitions and read them with tools/unpack_boot_image.py and tools/extract_fdt.py.", "Build the UEFI FD, flash the boot image, and record the first screen, last confirmed stage and log source."]
-findings = ["init_boot.img is header v4 with a 2,066,170-byte ramdisk; vendor_boot.img is header v4 with vendor_ramdisk_size 27,731,435 and dtb_size 190,500.", "dtbo.img holds one 240,233-byte DTBO with 208 fragments; the vendor_boot DTB is the MT6835 base tree (model \"MT6835\") and the overlay targets use unresolved 0xffffffff phandles until LK merges them.", "lk.img (2,897,568 bytes) carries kernel_load_addr and dtb_addr as runtime variables rather than text-form constants; the few 32-bit words equal to 0x40080000 have no established role, so the FD base stays the Plan A convention proven on merlinx and camellia until a hardware log confirms it.", "The stock boot images are padded to their partition sizes (boot and vendor_boot 64 MiB, init_boot and dtbo 8 MiB); the hashes in proprietary-files.txt cover the padded files."]
+findings = ["init_boot.img is header v4 with a 2,066,170-byte ramdisk; vendor_boot.img is header v4 with vendor_ramdisk_size 27,731,435 and dtb_size 190,500.", "dtbo.img holds one 240,233-byte DTBO with 208 fragments; the vendor_boot DTB is the MT6835 base tree (model \"MT6835\") and the overlay targets use unresolved 0xffffffff phandles until LK merges them.", "lk.img (2,897,568 bytes) carries kernel_load_addr and dtb_addr as runtime variables rather than text-form constants; the few 32-bit words equal to 0x40080000 have no established role, so the FD base stays the Plan A convention proven on merlinx and camellia until a hardware log confirms it.", "The stock boot images are padded to their partition sizes (boot and vendor_boot 64 MiB, init_boot and dtbo 8 MiB); the hashes in proprietary-files.txt cover the padded files.", "On the tablet the boot, vendor_boot and dtbo images match the pinned stock hashes, and /proc/iomem reserves the header addresses: dtb at 0x47c80000 and the ramdisk at 0x66f00000-0x68be2fff.", "init_boot_a does not match the pinned stock hash: the unit runs SukiSU Ultra in LKM mode (a kernelsu module is loaded and the stock kernel carries no KernelSU strings), so the pin still describes the package, not this unit's rooted boot partition.", "The stock cmdline carries fastboot_enable=1 and bootopt=64S3,32N2,64N2; neither demonstrates fastboot boot support."]
 completion = ["Firmware image builds, enters UniXNU, publishes the framebuffer and preserves the documented memory reservations."]
-limits = ["The stock LK's acceptance of a self-built header v2 image, the FD window at 0x40080000 and the flash method are unverified on hardware."]
-next_action = ["Run tools/collect-device-info.sh and compare the live FDT and LK log with the extracted values before the first boot attempt."]
+limits = ["The stock LK's acceptance of a self-built header v2 image, the FD window at 0x40080000, fastboot boot support and the flash method are unverified on hardware."]
+next_action = ["Build the FD once the uefi-tb365fc submodules resolve, then compare the live cmdline and reserved ranges with the image before the first boot attempt."]
 evidence = [
   { kind = "source", reference = "proprietary-files.txt", result = "SHA-256 pins for the stock boot, init_boot, vendor_boot, dtbo, lk and preloader images this area derives its geometry from." },
   { kind = "source", reference = "tools/unpack_boot_image.py", result = "Parsed the stock boot, init_boot and vendor_boot headers; produced the header versions, sizes and load addresses recorded above." },
+  { kind = "device", reference = "proprietary-files.txt", command = "sha256sum stock/boot_a.img stock/vendor_boot_a.img stock/dtbo_a.img stock/init_boot_a.img", revision = "5ba47e6284567baa3450f9d82b5d56963cd14035", result = "boot_a, vendor_boot_a and dtbo_a match the pins; init_boot_a differs because of the SukiSU LKM patch." },
 ]
 
 [[area]]
@@ -45,11 +48,13 @@ paths = ["dts/**", "configs/**", "patches/**"]
 inputs = ["Measured from the stock vendor_boot DTB: 6x Cortex-A55 at MPIDR affinities 0x0-0x500, 2x Cortex-A76 at 0x600-0x700, GIC distributor 0x0C000000 (256 KiB), redistributors 0x0C040000 (2 MiB) and a 13 MHz architected timer."]
 configuration = ["CONFIG_XNU_ARMCPU=y and CONFIG_XNU_ARM_DT_PLATFORM=y.", "dts/mt6835.dtsi carries the measured cluster layout, the PSCI conduit and the GIC ranges; tb365fc.dts enables the CPUs."]
 procedure = ["Compare dts/mt6835.dtsi with the stock FDT /cpus, interrupt-controller and timer nodes.", "After the first boot, check the PSCI conduit and per-CPU bring-up against /proc/cpuinfo and the stock dmesg."]
-findings = ["The stock topology is one GICv3 domain: A55 at affinity 0x0 and 0x100-0x500 (cluster type E), A76 at 0x600/0x700 (cluster type P). The earlier MT6833-style 0x0-0x1 / 0x100-0x105 guess was wrong.", "The architected timer runs at 13 MHz (clock-frequency 0xc65d40), and GICD spans 0x40000 bytes rather than 64 KiB.", "The stock tree has a /psci node (compatible arm,psci-1.0, method smc) and every CPU uses enable-method = \"psci\"; the dtsi conduit matches it.", "The stock tree uses four-cell interrupt specifiers whose trailing cell is a MediaTek wakeup flag; the ADT keeps the standard three-cell GIC form."]
+findings = ["The stock topology is one GICv3 domain: A55 at affinity 0x0 and 0x100-0x500 (cluster type E), A76 at 0x600/0x700 (cluster type P). The earlier MT6833-style 0x0-0x1 / 0x100-0x105 guess was wrong.", "The architected timer runs at 13 MHz (clock-frequency 0xc65d40), and GICD spans 0x40000 bytes rather than 64 KiB.", "The stock tree has a /psci node (compatible arm,psci-1.0, method smc) and every CPU uses enable-method = \"psci\"; the dtsi conduit matches it.", "The stock tree uses four-cell interrupt specifiers whose trailing cell is a MediaTek wakeup flag; the ADT keeps the standard three-cell GIC form.", "The on-device /proc/cpuinfo lists 8 CPUs: six 0xd05 (Cortex-A55) and two 0xd0b (Cortex-A76), matching the DTB affinities."]
 completion = ["Every enabled CPU reaches its entry checkpoint and timer/IPI handling works on each enabled CPU."]
-limits = ["SMP is not enabled on hardware; the PSCI conduit and cluster types are untested."]
+limits = ["SMP is not enabled in UniXNU; the PSCI conduit and cluster types are untested there, although Android already runs all eight cores."]
 next_action = ["Boot the first CPU on hardware, confirm the PSCI conduit, then enable the remaining cores one cluster at a time."]
-evidence = []
+evidence = [
+  { kind = "device", reference = "dts/tb365fc.dts", command = "adb shell cat /proc/cpuinfo", revision = "5ba47e6284567baa3450f9d82b5d56963cd14035", result = "Core count and part numbers (0xd05 x6, 0xd0b x2) match the cluster layout in the device tree." },
+]
 
 [[area]]
 id = "memory"
@@ -59,12 +64,13 @@ paths = ["dts/**", "tools/**", "patches/**"]
 inputs = ["DRAM base and size, reserved-memory carveouts and the IOMMU/SMMU stream inventory.", "The stock tree declares CMA pools (ssmr and ssheap, 256 MiB each, 16 MiB/2 MiB alignment) and dynamic carveouts whose final addresses are assigned by LK."]
 configuration = ["tb365fc.dts must expose exactly one enabled memory node with one contiguous range; the shared ADT generator rejects anything else.", "Reserved regions stay outside the contiguous DRAM range reported to XNU."]
 procedure = ["Read the stock DTB memory and reserved-memory nodes and reconcile them with /proc/iomem and /proc/meminfo on the rooted device.", "Regenerate the ADT and confirm chosen/dram-base and dram-size match the extracted values."]
-findings = ["The stock DTB memory node is a 1 GiB stub at 0x40000000 (0x0 0x40000000 0x0 0x40000000) that LK replaces at boot, so the DRAM size cannot be read from the DTB.", "The 8 GiB / 0x40000000 assumption in tb365fc.dts is still unverified; /proc/meminfo on the tablet is the authority."]
+findings = ["The stock DTB memory node is a 1 GiB stub at 0x40000000 (0x0 0x40000000 0x0 0x40000000) that LK replaces at boot, so the DRAM size cannot be read from the DTB.", "Measured on the tablet: MemTotal is 7,991,068 kB, CmaTotal 737,280 kB, and /proc/iomem maps DRAM from 0x40000000 to 0x23fffffff, confirming the 8 GiB range in tb365fc.dts.", "The live map reserves 0x47c80000-0x47ce6fff (DTB), 0x66f00000-0x68be2fff (vendor ramdisk) and secure ranges up to 0x23e5fffff; none of them may fall inside the range handed to XNU."]
 completion = ["All handoff regions are accounted for and each enabled DMA engine accesses its allocated range with the documented cache policy."]
-limits = ["The real DRAM size and the final reserved ranges are unknown."]
-next_action = ["Read MemTotal and /proc/iomem on the rooted tablet and update the memory node and reserved regions."]
+limits = ["The reserved ranges are LK-assigned and this is Android's post-LK view, not a UniXNU handoff contract; the final carveouts remain unknown."]
+next_action = ["Regenerate the ADT once the UEFI FD runs and diff its memory map against this inventory."]
 evidence = [
   { kind = "source", reference = "tools/extract_fdt.py", result = "Extracted the base DTB from the stock vendor_boot image and dumped its memory and reserved-memory nodes." },
+  { kind = "device", reference = "dts/tb365fc.dts", command = "adb shell cat /proc/meminfo; adb shell su -c cat /proc/iomem", revision = "5ba47e6284567baa3450f9d82b5d56963cd14035", result = "MemTotal and the System RAM interval 0x40000000-0x23fffffff confirm the 8 GiB memory node." },
 ]
 
 [[area]]
@@ -73,14 +79,15 @@ status = "planned"
 components = []
 paths = ["package/**", "patches/**", "tools/**"]
 inputs = ["Storage host candidates in the stock DTB: ufshci@112b0000 (\"mediatek,mt8183-ufshci\", reg 0x112b0000/0x2300, IRQ 0x189) is enabled, while mmc@11230000 (\"mediatek,mt6835-mmc\", reg 0x11230000/0x10000 + 0x11e70000/0x1000, IRQ 0x183) and mmc@11240000 are explicitly disabled.", "Stock scatter: boot_a 0x28F00000, vendor_boot_a 0x2CF00000, init_boot_a 0x30F00000, dtbo_a 0x31700000, super 0x4B000000 (0x2C0000000 bytes), userdata at byte 0x34C800000 in both the EMMC and UFS layout.", "The userdata partition geometry and the Data volume UUID."]
-configuration = ["[userdata] first_lba = 0x1A64000 and lba_bytes = 512 assume 512-byte sectors; a UFS LUN reporting 4096-byte logical blocks would make the same byte offset LBA 0x34C800. first_lba, last_lba and lba_bytes are REQUIRED until read from the device.", "A storage component is selected only after the host-controller inventory; no storage gate is enabled in tb365fc_defconfig yet."]
+configuration = ["[userdata] first_lba = 0x34C800, last_lba = 0x1DC8FF7 and lba_bytes = 4096 come from the on-device GPT; the APFS Data volume UUID is still REQUIRED.", "A storage component is selected only after the host-controller inventory; no storage gate is enabled in tb365fc_defconfig yet."]
 procedure = ["Read /proc/partitions, the GPT (sgdisk -p on the boot LUN: /dev/block/sda* for UFS or /dev/block/mmcblk0* for eMMC) and the queue/logical_block_size on the rooted device.", "Record the userdata entry LBA range and the APFS volume UUID used for root matching."]
-findings = ["The stock DTB enables a UFS host (ufshci@112b0000) and disables both MSDC hosts; the dtbo also carries the mt6377_vufs rail. The earlier \"eMMC on MSDC_0\" reading came from the scatter's first layout section and is not established.", "The scatter is a download map, not the GPT: its pgpt entry is NONE and the userdata size 0xC0000000 is the factory image, so the real partition may extend further.", "userdata starts at byte 0x34C800000 in both scatter layouts; the logical sector size (512 vs 4096) decides whether that is LBA 0x1A64000 or 0x34C800, so neither value is confirmed."]
+findings = ["The stock DTB enables a UFS host (ufshci@112b0000) and disables both MSDC hosts; the dtbo also carries the mt6377_vufs rail. The earlier \"eMMC on MSDC_0\" reading came from the scatter's first layout section and is not established.", "The scatter is a download map, not the GPT: its pgpt entry is NONE and the userdata size 0xC0000000 is the factory image, so the real partition may extend further.", "Measured on the tablet: the UFS host 112b0000.ufshci drives a Samsung KLUDG2R1JF-B0F1 LUN with 4096-byte logical sectors; /dev/block/sdc reports 249,921,536 512-byte sectors (127.96 GB) and a 71-entry GPT.", "GPT entries: userdata 0x34C800-0x1DC8FF7 (111,091,680 KiB), boot_a 0x28F00 and vendor_boot_a 0x2CF00 (64 MiB each), init_boot_a 0x30F00 and dtbo_a 0x31700 (8 MiB each), super 0x4B000 (11 GiB); the init_boot_b entry is 11,776 KiB, an asymmetry in the factory table."]
 completion = ["Host: register, clock, link and SMMU facts match the board inventory.", "Reads: SCSI capacity, GPT and known blocks are correct; OS/SystemOS windows stay within userdata.", "Root: the configured volume mounts and launchd starts. Persistence: writes survive reboot within the allocated Data region."]
-limits = ["The storage type (UFS vs eMMC), the userdata end, the logical block size and the Data volume UUID are unverified; the firmware has no UFS driver or UFS MMIO window, and MsdcDxe is the only storage path."]
-next_action = ["Capture /proc/partitions and the block-device queue attributes from the tablet to settle UFS vs eMMC, then set first_lba, last_lba, lba_bytes and root_match_volume_uuid."]
+limits = ["UniXNU's firmware has no UFS driver (MsdcDxe is the only storage path) and the SMMU stream wiring is unknown; the Data volume UUID cannot be set until APFS is installed."]
+next_action = ["Port a UFS host path into the firmware, then record the GPT and the Data volume UUID once APFS is installed."]
 evidence = [
   { kind = "source", reference = "tools/extract_fdt.py", result = "Identified the enabled UFS host, the disabled MSDC hosts and their register windows in the stock base DTB." },
+  { kind = "device", reference = "tools/pull-stock-images.sh", command = "adb shell su -c 'dd if=/dev/block/sdc bs=4096 count=34' with a local GPT parse", revision = "5ba47e6284567baa3450f9d82b5d56963cd14035", result = "GPT at 4096-byte sectors: the userdata LBA range and the A/B boot partition sizes match the board.toml [userdata] values." },
 ]
 
 [[area]]
@@ -91,12 +98,13 @@ paths = ["package/**", "patches/**", "dts/**", "tools/**"]
 inputs = ["DSI panel variant from the stock overlay: panel1@0 \"boe,hx83122b,vdo\" or panel2@1 \"tm,nt36532,vdo\", both video-mode with TE.", "Panel rails and GPIOs: power enable GPIO 0x22, backlight enables 0x15/0x19, reset GPIO 0x56 (86), bias GPIOs 0x7c (124) and 0x97 (151).", "Backlight controllers ST7758 and AW99706 at I2C addresses 0x2e and 0x76 on two panel channels.", "Panel resolution, refresh rate and init sequence from the vendor LCM driver; the device tree carries no timings."]
 configuration = ["Bootstrap relies on the firmware GOP framebuffer only; no XNU display provider is selected yet."]
 procedure = ["Record the active panel compatible, wm size and wm density on the tablet and match them with the stock LCM driver name from the LK/kernel log.", "Record the GOP mode from the UEFI boot log when the first firmware image runs."]
-findings = ["The board ships with either a BOE HX83122B or a Tianma NT36532 video-mode panel using the same rails, reset and TE wiring.", "The touch coordinate space (16000 x 25600) implies a 16:10 panel; the exact resolution and refresh rate are still unverified.", "Backlight is an external ST7758 or AW99706 controller per panel channel, not a PMIC block."]
+findings = ["The board ships with either a BOE HX83122B or a Tianma NT36532 video-mode panel using the same rails, reset and TE wiring.", "Measured on the tablet: 1600x2560 at 90.00 Hz with a physical density of 249.46 dpi (ro.sf.lcd_density 320), so the panel is portrait 1600x2560.", "Both panel1@0 and panel2@1 stay enabled in the live merged FDT; the active variant is picked at runtime by LK, so the tree alone cannot name it.", "Backlight is an external ST7758 or AW99706 controller per panel channel, not a PMIC block."]
 completion = ["A known frame appears with correct geometry and colors, then userland presentation and backlight controls work."]
-limits = ["Panel timings, resolution, refresh rate and the active panel variant are unknown."]
-next_action = ["Read wm size, wm density and the active LCM driver name on the tablet."]
+limits = ["Panel timings, the active panel variant and the GOP mode are unknown; only the active resolution, refresh rate and density are measured."]
+next_action = ["Capture the LK/early kernel log to name the active LCM driver, then record the GOP mode when the firmware first runs."]
 evidence = [
   { kind = "source", reference = "tools/extract_fdt.py", result = "Extracted the stock dtbo overlay that declares both panel variants, their rails and the backlight controllers." },
+  { kind = "device", reference = "tools/collect-device-info.sh", command = "adb shell dumpsys SurfaceFlinger | grep activeMode", revision = "5ba47e6284567baa3450f9d82b5d56963cd14035", result = "Active mode 1600x2560 at 90.00 Hz, dpi 249.46, matching wm size and ro.sf.lcd_density 320." },
 ]
 
 [[area]]
@@ -107,12 +115,13 @@ paths = ["package/**", "patches/**", "dts/**", "tools/**"]
 inputs = ["Touch over SPI at 10 MHz (0x989680) with spi-cpha: IRQ GPIO 4 (active low), reset GPIO 43 (0x2b), dual driver set himax,hxcommon and novatek,NVT-ts-spi, Novatek 40x64 node grid (mp-criteria-6096).", "Pogo keyboard node \"lenovo,lenovo_keyboard\" and MT6377 PMIC keys."]
 configuration = ["Input components are selected only after the SPI bus and GPIO inventory; no input gate is enabled yet."]
 procedure = ["Read the stock overlay touch/keys nodes and /sys/class/input on the rooted device.", "Record which touch firmware variant the unit actually runs and the pogo keyboard protocol."]
-findings = ["Touch is a Himax/Novatek SPI part on IRQ GPIO 4 with reset on GPIO 43.", "A Lenovo pogo keyboard and MT6377 PMIC keys (power, volume) are present."]
+findings = ["Touch is a Himax/Novatek SPI part on IRQ GPIO 4 with reset on GPIO 43.", "A Lenovo pogo keyboard and MT6377 PMIC keys (power, volume) are present.", "Measured on the tablet: /dev/input exposes himax-touchscreen (event2), lenovo-stylus (event3), mtk-kpd (event1), mtk-pmic-keys (event0), hall_irq (event5) and the MT6377 headset jack (event4); the Himax driver is the one bound on this unit."]
 completion = ["Touches map to the display, simultaneous contacts keep stable IDs, release events arrive, and buttons produce expected HID reports."]
-limits = ["The active touch firmware and the button/keyboard map are unverified."]
-next_action = ["Read /sys/class/input and the input device names on the tablet to pin the touch variant and the keyboard protocol."]
+limits = ["The pogo keyboard was not attached during collection, so its protocol and the key map are unverified; the stylus HID descriptor is not recorded yet."]
+next_action = ["Attach the pogo keyboard, record its input device and key map, then map the touch range 16000x25600 onto the panel."]
 evidence = [
   { kind = "source", reference = "tools/extract_fdt.py", result = "Extracted the stock overlay touch node with its SPI frequency, GPIOs and driver compatibles." },
+  { kind = "device", reference = "dts/tb365fc.dts", command = "adb shell getevent -pl", revision = "5ba47e6284567baa3450f9d82b5d56963cd14035", result = "Input devices match: himax-touchscreen, lenovo-stylus, mtk-kpd, mtk-pmic-keys, hall_irq and the headset jack." },
 ]
 
 [[area]]
@@ -137,12 +146,13 @@ paths = ["package/**", "patches/**", "dts/**", "tools/**", "proprietary-files.tx
 inputs = ["MediaTek connsys block: wifi@18000000 (\"mediatek,wifi\", 1 MiB register window, IRQ 0x83, 6 MiB EMI window) and consys@18002000 (\"mediatek,mt6835-consys\") behind the MT6377 connsys power gate.", "Bluetooth firmware connsys_bt.img from the stock package."]
 configuration = ["No network component is selected; the bootstrap image has no network stack input."]
 procedure = ["Identify the combo chip and firmware variant from the vendor kernel log and /sys/kernel/debug on the tablet, then record hashes in proprietary-files.txt."]
-findings = ["Wi-Fi is a MediaTek connsys block at 0x18000000, not an SDIO/PCIe part.", "connsys_bt.img (4,287,968 bytes) embeds the Wi-Fi PHY path phy/6631 and the \"MTK SOC2_2\" connectivity revision, which points at an MT6631-class combo; the exact die still needs the vendor kernel log on the tablet.", "The stock tree names only the SoC block (mediatek,mt6835-consys) behind the MT6377 connsys power gate, so the chip identity comes from the firmware, not the device tree."]
+findings = ["Wi-Fi is a MediaTek connsys block at 0x18000000, not an SDIO/PCIe part.", "connsys_bt.img (4,287,968 bytes) embeds the Wi-Fi PHY path phy/6631 and the \"MTK SOC2_2\" connectivity revision.", "Measured on the tablet: persist.vendor.connsys.chipid is 0x6835 (the SoC) while vendor.connsys.adie.chipid is 0x6631 for Wi-Fi, BT, GPS and FM; the BT firmware names MT6631 ASIC MINIROM with patch 20250110150354, so the combo die is MT6631.", "Android's wlan_drv_gen4m_6835 is running and carrying traffic, so the stock hardware path works."]
 completion = ["Scanning, association, address configuration and sustained receive/transmit traffic pass with the selected firmware."]
-limits = ["The exact Wi-Fi/BT die, firmware ABI and MAC provisioning are unverified."]
-next_action = ["Read the connsys firmware banner from the vendor kernel log on the tablet to confirm the MT6631 variant."]
+limits = ["The UniXNU side has no firmware ABI or MAC provisioning; the firmware files live on the vendor partition and are not in this repository."]
+next_action = ["When network work starts, inventory the vendor firmware names and hashes and the connsys power/EMI windows."]
 evidence = [
   { kind = "source", reference = "proprietary-files.txt", result = "Records the SHA-256 of connsys_bt.img and its source partition." },
+  { kind = "device", reference = "proprietary-files.txt", command = "adb shell getprop | grep -i connsys", revision = "5ba47e6284567baa3450f9d82b5d56963cd14035", result = "ADIE chip id 0x6631 for Wi-Fi/BT/GPS/FM and an MT6631 BT firmware banner settle the combo die." },
 ]
 
 [[area]]
@@ -169,12 +179,13 @@ paths = ["package/**", "patches/**", "dts/**", "tools/**"]
 inputs = ["MT6377 PMIC (bucks, LDOs, charger, gauge, RTC, keys, accdet), MT6685 RTC/clock buffer, the MT6319 external buck (mt6315_3 regulator) and the RT5133 GPIO expander.", "MM8013 fuel gauge, a PPS charger path built on the Southchip SC89890H plus an SGM charger, and the AW35615 USB-PD controller."]
 configuration = ["The bootstrap image runs without a battery/charger driver; sleep-disabled defaults stay in place."]
 procedure = ["Record PMIC registers, regulator rails and battery thresholds from the stock DTB before writing a power driver."]
-findings = ["The PMIC is MT6377, not MT6359; it also provides the MT6377-keys used for the power and volume buttons.", "The stock overlay lists the full regulator set (vbuck1-6, vs1/vs2, vsram, va12/vaud18/vaud28, vaux18, vbif28, vcn33/vcn18, vxo22, vm18, vemc, vio18, vrf rails, vmc, vusb, vmch) and the gauge/RTC/charger children.", "Charging is a PPS path (\"mediatek,charger,pps\") with a two-charger configuration: Southchip SC89890H at I2C 0x6a and an SGM charger at 0x6c, with the AW35615 PD controller at 0x22."]
+findings = ["The PMIC is MT6377, not MT6359; it also provides the MT6377-keys used for the power and volume buttons.", "The stock overlay lists the full regulator set (vbuck1-6, vs1/vs2, vsram, va12/vaud18/vaud28, vaux18, vbif28, vcn33/vcn18, vxo22, vm18, vemc, vio18, vrf rails, vmc, vusb, vmch) and the gauge/RTC/charger children.", "Charging is a PPS path (\"mediatek,charger,pps\") with a two-charger configuration: Southchip SC89890H at I2C 0x6a and an SGM charger at 0x6c, with the AW35615 PD controller at 0x22.", "Measured on the tablet: the MM8013 gauge driver fg_mm801310c reports VBAT/VBUS, and the charger stack runs sc8989x on I2C 7-006a plus sc8541 on 5-006a under the PPS policy; MT6377 supplies the PMIC keys and the headset-jack codec path."]
 completion = ["Declared power controls and battery readings match observations; each claimed sleep/resume transition restores its dependent peripherals."]
-limits = ["No power driver is written; charger, gauge and RTC register maps are unverified."]
+limits = ["No power driver is written; charger, gauge and RTC register maps are unverified for UniXNU."]
 next_action = ["Record the PMIC I2C addresses and the rails the panel, touch and storage depend on."]
 evidence = [
   { kind = "source", reference = "tools/extract_fdt.py", result = "Extracted the stock overlay PMIC, regulator and gauge nodes." },
+  { kind = "device", reference = "tools/collect-device-info.sh", command = "adb shell su -c dmesg", revision = "5ba47e6284567baa3450f9d82b5d56963cd14035", result = "fg_mm801310c, sc8989x 7-006a and sc8541 5-006a report battery and charger state." },
 ]
 
 [[area]]
@@ -185,12 +196,13 @@ paths = ["package/**", "patches/**", "tools/**", "unixnu.lock"]
 inputs = ["The payload image, the boot/vendor_boot layout accepted by the TB365FC LK, the flash method (fastboot flash boot_a) and the partition size limits.", "Stock boot image v4 (no load addresses); stock vendor_boot addresses tags/dtb 0x47C80000 and ramdisk 0x66F00000; partition sizes boot/vendor_boot 64 MiB, dtbo/init_boot 8 MiB."]
 configuration = ["Plan A packs the UEFI FD in an Android boot header v2 image at base 0x40000000 with kernel_offset 0x80000 and tags/dtb_offset 0x7C80000; Plan B packs the Linux preboot handoff plus the payload in vendor_boot.", "The payload volume is FAT, labelled TB365FC, 192 MiB."]
 procedure = ["Build the payload and boot image, then verify the header fields and offsets against the stock boot image before flashing.", "Record every flash command and the exact image revision."]
-findings = ["The stock header is v4 while UniXNU builds v2 so that LK honours kernel_addr = 0x40080000; v2 is proven on merlinx and camellia (same MTK family) but not on this LK yet.", "The stock images are padded to the partition sizes, so image hashes cover the padding as well."]
+findings = ["The stock header is v4 while UniXNU builds v2 so that LK honours kernel_addr = 0x40080000; v2 is proven on merlinx and camellia (same MTK family) but not on this LK yet.", "The stock images are padded to the partition sizes, so image hashes cover the padding as well.", "The on-device GPT confirms boot_a and vendor_boot_a are 64 MiB and init_boot_a and dtbo_a 8 MiB, so a self-built boot image must stay below 64 MiB; the init_boot_b entry is 11,776 KiB."]
 completion = ["Kernel and prelink succeed, payload contains all declared inputs, and the boot image matches the bootloader format and size limit."]
 limits = ["The self-built image has not been accepted by the TB365FC bootloader; the flash path is untested."]
 next_action = ["Build the first boot image and compare every header field with Resources/Configs/tb365fc.toml before flashing."]
 evidence = [
   { kind = "source", reference = "tools/unpack_boot_image.py", result = "Verified the Android boot header fields used to derive the image geometry." },
+  { kind = "device", reference = "tools/pull-stock-images.sh", command = "local GPT parse of adb shell su -c 'dd if=/dev/block/sdc bs=4096 count=34'", revision = "5ba47e6284567baa3450f9d82b5d56963cd14035", result = "boot_a and vendor_boot_a are 64 MiB, init_boot_a and dtbo_a 8 MiB, bounding the self-built image sizes." },
 ]
 
 [[area]]
@@ -199,13 +211,14 @@ status = "planned"
 components = []
 paths = ["tools/**", "package/tests/**", "package/*Probe*", "unixnu.lock", "README.md"]
 inputs = ["adb/fastboot access on the rooted tablet, the stock boot/vendor_boot/dtbo images, serial or pstore log capture, and the UEFI boot log from uefi-tb365fc."]
-configuration = ["tools/collect-device-info.sh writes a local, privacy-filtered inventory; tools/unpack_boot_image.py and tools/extract_fdt.py read Android boot images and extract their DTBs."]
-procedure = ["Run the collection script over adb and archive the output next to the firmware hashes.", "Record the last confirmed boot stage and the matching image revision for every hardware checkpoint."]
-findings = ["The stock package was unpacked on the host with the tools in this repository; no hardware checkpoint has been reproduced on this board yet.", "The extracted facts live in the area entries above; no stock image is committed."]
+configuration = ["tools/collect-device-info.sh writes a local, privacy-filtered inventory; tools/unpack_boot_image.py and tools/extract_fdt.py read Android boot images and extract their DTBs.", "The scripts export MSYS_NO_PATHCONV on Git Bash so /dev/block paths reach adb unmangled, and the property filter drops psn and bootloader serial keys."]
+procedure = ["Run the collection script over adb and archive the output outside the repository.", "Record the last confirmed boot stage and the matching image revision for every hardware checkpoint."]
+findings = ["The stock package was unpacked on the host with the tools in this repository; no UniXNU boot checkpoint exists on this board yet.", "The script ran on the unit after two fixes: MSYS path conversion was rewriting /dev paths (173564d) and the property filter missed psn/bootload_sn (5ba47e6); the clean inventory stays outside the repository because the FDT embeds device-unique data.", "Root came from SukiSU Ultra in LKM mode: adb su works only with SU compat enabled and yields u:r:ksu:s0; the stock kernel has no KernelSU strings.", "fastboot getvar all ran in bootloader mode and reported an unlocked bootloader; the dump stays local because it carries the bootloader serial."]
 completion = ["Each claimed milestone has a reproducible command, a matching source/image revision and an accessible result."]
-limits = ["The tablet has not been queried; the inventory script is untested on this unit."]
-next_action = ["Run the collection tools and attach the first inventory to the firmware area."]
+limits = ["The inventory is a local snapshot; reproducing it needs the scripts at 5ba47e6 or later. Early-boot logs (LK, pstore) are not captured yet."]
+next_action = ["Add a pstore/LK log capture path before the first UEFI boot attempt."]
 evidence = [
   { kind = "source", reference = "tools/unpack_boot_image.py", result = "Ran against the stock boot, init_boot and vendor_boot images." },
   { kind = "source", reference = "tools/extract_fdt.py", result = "Extracted the base DTB and the DTBO entry from the stock images." },
+  { kind = "device", reference = "tools/collect-device-info.sh", command = "tools/collect-device-info.sh", revision = "5ba47e6284567baa3450f9d82b5d56963cd14035", result = "Produced the clean inventory (identity, meminfo, GPT head, iomem, filtered dmesg, FDT) used across the areas above." },
 ]
