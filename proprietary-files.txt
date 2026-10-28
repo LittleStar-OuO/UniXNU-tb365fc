@@ -1,0 +1,16 @@
+# Required firmware inputs: relative path | source | SHA-256 | consumer
+# Hashes cover the files of the ZUXOS 1.1.10.122 SP Flash Tool package (build
+# TB365FC_CN_OPEN_USER_M1317.3_V_ZUXOS_1.1.10.122_ST_250828). Partition images are
+# padded to their scatter size, so a hash identifies the shipped file and not the
+# meaningful payload prefix.
+#
+# Keep hashes only; do not commit extracted firmware, bootloader images or device-unique
+# data (serial numbers, Wi-Fi/Bluetooth MACs) to this repository.
+
+firmware/boot.img | boot_a of ZUXOS 1.1.10.122 | 52fd4ff2e328888e23190135a921fb7beae1bb088a6e7ac51d1301099484a416 | firmware, packaging
+firmware/init_boot.img | init_boot_a of ZUXOS 1.1.10.122 | 69b50a191a2bc46cb287553aa15a00832109f3f4faea27f8dc7855aa68bb75e6 | firmware
+firmware/vendor_boot.img | vendor_boot_a of ZUXOS 1.1.10.122 | e361c9eae8289ff84ddb84b64e90a6e3b9e83eadea72ab658ddafbc2b4713291 | firmware, cpu, memory, display, input, network
+firmware/dtbo.img | dtbo_a of ZUXOS 1.1.10.122 | 38e289c1799e5e345034f40d7a71bc44970226741c6a8f9675877da3e601b68b | display, input, audio, power
+firmware/lk.img | lk_a of ZUXOS 1.1.10.122 | 02f5dbc1065cd92ddfdc5f26f8d7734e1ab88c2f33a335df6bcde4bbaa08f64c | firmware
+firmware/preloader_cava_prc_consumer_wifi.bin | preloader_cava_prc_consumer_wifi of ZUXOS 1.1.10.122 | f766d9046e140e88b978a95f45c94e4638d94bd7c14916d40900748efb7f7fb2 | firmware
+firmware/connsys_bt.img | connsys_bt_a of ZUXOS 1.1.10.122 | 2ad17736ed890d0d71034c72a2f2f1a4b162cab3cecdbe8ea6891d9b12e2f2b1 | network

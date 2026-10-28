@@ -1,0 +1,15 @@
+# Kernel configuration of the TB365FC bootstrap image.
+# CONFIG_XNU_<NAME> becomes XNU_<NAME>; y and n are 1 and 0, quoted values pass through.
+#
+# The ARM64 profile already enables the source kernel, software AES, architected timer,
+# mockfs and panic paths. This file only records board/SoC decisions that differ.
+
+CONFIG_XNU_ARM_DT_PLATFORM=y
+CONFIG_XNU_ARMCPU=y
+CONFIG_XNU_NATIVE_ARCH_TIMER=y
+CONFIG_XNU_NATIVE_PAN=y
+CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
+CONFIG_XNU_ARMVIRT_PLATFORM=n
+
+# Storage (UFS or eMMC), display, input and GPU gates are added area by area once the
+# hardware inventory in porting.toml is complete.

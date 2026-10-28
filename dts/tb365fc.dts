@@ -1,0 +1,28 @@
+/*
+ * Lenovo TB365FC (Xiaoxin Pad 12.1 2025), board cava_prc_consumer_wifi.
+ *
+ * Shared MT6835 resources come from the selected SoC repository. This file owns the
+ * board memory map, reserved regions and peripheral wiring.
+ *
+ * REQUIRED values are replaced from the stock firmware DTB and the device inventory
+ * produced by scripts/collect-device-info.sh in the UniXNU-tb365fc tools directory.
+ */
+
+/dts-v1/;
+/include/ "mt6835.dtsi"
+
+/ {
+	model = "Lenovo TB365FC";
+	compatible = "lenovo,tb365fc", "mediatek,mt6835";
+
+	/*
+	 * REQUIRED: one contiguous DRAM range. The stock vendor_boot DTB only carries a
+	 * 1 GiB LK placeholder at 0x40000000; the real size must come from /proc/meminfo.
+	 * The 8 GiB range below matches the announced configuration and still needs
+	 * confirmation (the ADT generator accepts exactly one range).
+	 */
+	memory@40000000 {
+		device_type = "memory";
+		reg = <0x0 0x40000000 0x2 0x00000000>;
+	};
+};

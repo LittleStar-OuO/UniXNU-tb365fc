@@ -1,0 +1,8 @@
+# The MT6835 shared layer. During bring-up the local checkout next to this repository is
+# used; it is never written to unixnu.lock. Before publication, remove local and pin the
+# reviewed commit of the published repository instead.
+[[source]]
+name = "mt6835"
+kind = "soc"
+git = "https://github.com/UniXNU/UniXNU-mt6835-common"
+local = "../UniXNU-mt6835-common"

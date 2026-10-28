@@ -1,0 +1,84 @@
+schema_version = 2
+
+[board]
+# Keep example = true until the firmware extraction replaces every REQUIRED value.
+example = true
+name = "tb365fc"
+soc = "MT6835"
+soc_source = "mt6835"
+os_profile = "ipados-17.7.11-21H461"
+description = "Lenovo Xiaoxin Pad 12.1 (2025), Lenovo TB365FC (board cava_prc_consumer_wifi)"
+kit = "tb365fc"
+
+[components]
+# Bootstrap set only. Storage, display, input, GPU, network and power components are
+# added after the driver adaptation checklist is complete for this board.
+include = ["ArmDTPlatform", "ArmCpu", "SoftwareAES", "XnuPrelink", "DarwinBoot"]
+
+[kernel]
+defconfig = "tb365fc_defconfig"
+config_fragments = ["arch:configs/common.config", "soc:configs/mt6835.config", "os:configs/ipados.config"]
+patch_series = ["arch:patches/xnu/series", "soc:patches/xnu/series", "os:patches/xnu/series", "device:patches/xnu/series"]
+
+[device_tree]
+source = "device:dts/tb365fc.dts"
+include_dirs = ["soc:dts"]
+
+[firmware]
+# Paths inside the uefi-tb365fc checkout (--uefi).
+config = "tb365fc"
+dsc = "Platforms/Lenovo/tb365fcPkg/tb365fc.dsc"
+fd = "Build/tb365fcPkg/{target}_CLANGPDB/FV/SILICIUM_UEFI.fd"
+submodules = [
+  "Common/Mu",
+  "Common/Mu_OEM_Sample",
+  "Mu_Basecore",
+  "Silicon/Silicium/OpensslPkg/Library/OpensslLib/openssl",
+]
+packages = [
+  "{uefi}",
+  "{uefi}/Platforms/Lenovo",
+  "{uefi}/Silicon/MediaTek",
+  "{uefi}/Silicon/Silicium",
+  "{tree}/package",
+  "{tree}/drivers/DarwinBoot",
+  "{edk2}",
+  "{uefi}/Common/Mu",
+  "{uefi}/Common/Mu_OEM_Sample",
+]
+
+[firmware.defines]
+DEVICE_MODEL = "TB365FC"
+
+[userdata]
+# REQUIRED: the stock scatter places userdata at byte 0x34C800000 in both its EMMC
+# and UFS layouts. The stock DTB enables ufshci@112b0000 and disables both MSDC hosts,
+# so the storage type and sector size are unsettled; 0x1A64000 assumes 512-byte sectors.
+first_lba = 0x1A64000
+# REQUIRED: the scatter is not the GPT (its pgpt entry is NONE) and its 0xC0000000-byte
+# size is the factory image. Read the real start/end and logical block size from
+# /proc/partitions and the block queue on the tablet.
+last_lba = 0
+lba_bytes = 512
+windows = [
+  { name = "OS", component = "OS" },
+  { name = "SystemOS", component = "Cryptex1,SystemOS" },
+]
+
+[payload]
+volume = "TB365FC"
+size_mib = 192
+loader = "firmware"
+title = "UniXNU"
+kernel_args = ["-v", "serial=3"]
+
+[payload.adt]
+# A stable software identity seed for this board, not an Apple silicon chip ID.
+chip_id = "0x365FC"
+# Supply the unique 64-bit id through --unique-chip-id.
+unique_chip_id = "required"
+# REQUIRED: the APFS volume UUID of the installed Data volume.
+root_match_volume_uuid = "REQUIRED_ROOT_VOLUME_UUID"
+# Continuous DarwinBoot window, 256 MiB; accepted range is 256 MiB to 8 GiB in 2 MiB steps.
+owned_memory_size = "0x10000000"
+psci_method = "smc"
