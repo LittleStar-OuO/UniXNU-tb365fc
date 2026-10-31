@@ -288,16 +288,15 @@ static bool hostBringUp (const char **why)
     if (!hostStopQueue (why)) return false;
     if (!hostStartQueue (why)) return false;
   } else {
-    // HCE stays on: cycle only if the handoff left it off, then quiet the
-    // queue and walk the UniPro link back up. LK's power-off notify cuts the
-    // device rails and leaves a host power-mode change pending, so the MTK
-    // power-up and the wake ladder run before the prelink and link startup.
+    // LK's power-off notify cut the device rails and stopped inside a host power-mode change
+    // (HCS.UPMCRS=PWR_LOCAL), which makes every link-level UIC command fail. Power the MTK
+    // stack up, then reset the host controller: the reset clears UPMCRS and the stale request
+    // list, and only then does the wake ladder stand a chance. The queue starts after the
+    // link, since DP drops to 0 across the reset.
     gRootDiagnostic.stage = "mtk power up";
     hostMtkPowerUp ();
-    gRootDiagnostic.stage = "host controller enable";
-    if (!hostEnableController (why)) return false;
-    gRootDiagnostic.stage = "request list";
-    if (!hostStopQueue (why)) return false;
+    gRootDiagnostic.stage = "host controller reset";
+    if (!hostResetController (why)) return false;
     gRootDiagnostic.stage = "link wake";
     hostLinkWake ();
     gRootDiagnostic.stage = "link prelink";
@@ -313,9 +312,6 @@ static bool hostBringUp (const char **why)
     }
     for (unsigned i = 0; i < 5; ++i) gRootDiagnostic.uic[i] = read32 (gHost.hc, 0x38 + 4 * i);
     gRootDiagnostic.linkOk = linked ? 1 : 0;
-    // HCS.DP is stale in both directions, so a failed startup still proceeds: the device wake
-    // below is the one UPIU a powered-down device answers, and it decides whether the link
-    // recovered. A dead link then fails at the request list or the wake itself.
     gRootDiagnostic.stage = "request list";
     if (!hostStartQueue (why)) return false;
   }

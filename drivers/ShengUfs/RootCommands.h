@@ -150,6 +150,22 @@ static uint32_t mtkSmc (uint32_t command, uint32_t arg1, uint32_t arg2)
   return static_cast<uint32_t> (x0);
 }
 
+// REFCLK request and XOUFS enable, rerun after an HCE reset in case the reset cleared them.
+static void hostMtkClockOn (void)
+{
+  write32 (gHost.hc, 0x144, read32 (gHost.hc, 0x144) | 1);       // REFCLK_REQUEST
+  uint32_t ack = 0, reg = 0;
+  for (unsigned attempt = 0; attempt < 300; ++attempt) {
+    reg = read32 (gHost.hc, 0x144);
+    ack = ((reg >> 1) & 1) == (reg & 1);                          // REFCLK_ACK follows REQUEST
+    if (ack) break;
+    IODelay (10);
+  }
+  gRootDiagnostic.phyAck = ack;
+  write32 (gHost.hc, 0x140, read32 (gHost.hc, 0x140) | 0x80);    // XOUFS enable
+  gRootDiagnostic.xoufs2 = read32 (gHost.hc, 0x140);
+}
+
 // Power the UFS stack up the way UfsMtkDxe does before HCE: EL3 turns MTCMOS and SRAM on and gives the device rails
 // a reset pulse, then the PDN/AO reset lines are released, the M-PHY leaves isolation, the 26 MHz reference is
 // requested and XOUFS enabled. Without this the link startup has no peer to talk to.
@@ -192,17 +208,7 @@ static void hostMtkPowerUp (void)
     IODelay (10);
     gRootDiagnostic.phy8c = read32 (phy, 0x8c);
   }
-  write32 (gHost.hc, 0x144, read32 (gHost.hc, 0x144) | 1);       // REFCLK_REQUEST
-  uint32_t ack = 0, reg = 0;
-  for (unsigned attempt = 0; attempt < 300; ++attempt) {
-    reg = read32 (gHost.hc, 0x144);
-    ack = ((reg >> 1) & 1) == (reg & 1);                          // REFCLK_ACK follows REQUEST
-    if (ack) break;
-    IODelay (10);
-  }
-  gRootDiagnostic.phyAck = ack;
-  write32 (gHost.hc, 0x140, read32 (gHost.hc, 0x140) | 0x80);    // XOUFS enable
-  gRootDiagnostic.xoufs2 = read32 (gHost.hc, 0x140);
+  hostMtkClockOn ();
   gRootDiagnostic.aoStatus2 = ao ? read32 (ao, 0x04) : 0xffffffff;
   gRootDiagnostic.pdnStatus2 = pdn ? read32 (pdn, 0x04) : 0xffffffff;
 }
@@ -252,19 +258,26 @@ static IOReturn hostUicCommand (uint32_t opcode, uint32_t arg1, uint32_t arg3, u
   return status;
 }
 
-// The MTK bootloader hands over with HCE already set. Never cycle it: on this block HCE does not
-// come back after a 0->1 toggle until the vendor power-up sequence (SMC rails, PHY, REFCLK) has run,
-// which is what diag83 tripped over. Only force it when the handoff left it off.
-static bool hostEnableController (const char **why)
+// The handoff leaves HCS.UPMCRS=PWR_LOCAL (LK's power-off notify stopped inside a power mode change) and a failed
+// SSU turns that into PWR_FATAL; UFSHCI names a host controller reset as the remedy for both, and it also clears
+// the stale request list. diag83 showed HCE never comes back from a 0->1 toggle until the vendor power-up sequence
+// has run, so this only runs after hostMtkPowerUp.
+static bool hostResetController (const char **why)
 {
-  if (read32 (gHost.hc, 0x34) & 1) {
-    return true;
-  }
-  hostWrite (0x34, 1);
-  if (!hostWaitMaskFor (0x34, 1, 1, 3000000)) {
-    *why = "host controller enable";
+  hostWrite (0x34, 0);
+  if (!hostWaitMaskFor (0x34, 1, 0, 3000000)) {
+    *why = "host controller reset (HCE clear)";
     return false;
   }
+  IODelay (10);
+  hostWrite (0x34, 1);
+  if (!hostWaitMaskFor (0x34, 1, 1, 3000000)) {
+    *why = "host controller reset (HCE set)";
+    return false;
+  }
+  hostMtkClockOn ();
+  gRootDiagnostic.resetHce = read32 (gHost.hc, 0x34) & 1;
+  gRootDiagnostic.resetHcs = read32 (gHost.hc, 0x30);
   return true;
 }
 
