@@ -179,20 +179,16 @@ static IOReturn hostUicCommand (uint32_t opcode, uint32_t arg1, uint32_t arg3, u
   return status;
 }
 
-// Disable the host controller and enable it again: the cycle resets the UTP lists, the UIC channel and a fatal
-// power-mode-change status left by the bootloader, and is what the UEFI UFS stack does before its own link startup.
-static bool hostResetController (const char **why)
+// The MTK bootloader hands over with HCE already set. Never cycle it: on this block HCE does not
+// come back after a 0->1 toggle until the vendor power-up sequence (SMC rails, PHY, REFCLK) has run,
+// which is what diag83 tripped over. Only force it when the handoff left it off.
+static bool hostEnableController (const char **why)
 {
   if (read32 (gHost.hc, 0x34) & 1) {
-    hostWrite (0x34, 0);
-    if (!hostWaitMaskFor (0x34, 1, 0, 100000)) {
-      *why = "host controller stop";
-      return false;
-    }
+    return true;
   }
-  hostWrite (0x20, 0xffffffff);
   hostWrite (0x34, 1);
-  if (!hostWaitMaskFor (0x34, 1, 1, 300000)) {
+  if (!hostWaitMaskFor (0x34, 1, 1, 3000000)) {
     *why = "host controller enable";
     return false;
   }

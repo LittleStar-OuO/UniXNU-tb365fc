@@ -275,12 +275,18 @@ static bool hostBringUp (const char **why)
     if (!hostStopQueue (why)) return false;
     if (!hostStartQueue (why)) return false;
   } else {
-    gRootDiagnostic.stage = "host controller reset";
-    if (!hostResetController (why)) return false;
+    // HCE stays on: cycle only if the handoff left it off, then quiet the
+    // queue and wake the parked UniPro link the way the MTK driver does.
+    gRootDiagnostic.stage = "host controller enable";
+    if (!hostEnableController (why)) return false;
+    gRootDiagnostic.stage = "request list";
+    if (!hostStopQueue (why)) return false;
     gRootDiagnostic.stage = "link prelink";
     hostLinkPrelink ();
     gRootDiagnostic.stage = "link startup";
-    if (!hostLinkStartup (why)) return false;
+    bool linked = hostLinkStartup (why);
+    for (unsigned i = 0; i < 5; ++i) gRootDiagnostic.uic[i] = read32 (gHost.hc, 0x38 + 4 * i);
+    if (!linked) return false;
     gRootDiagnostic.stage = "request list";
     if (!hostStartQueue (why)) return false;
   }
