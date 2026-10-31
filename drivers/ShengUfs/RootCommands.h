@@ -130,11 +130,83 @@ static IOReturn hostProtocolError (uint32_t reason)
 }
 
 // ---- MTK UIC link bring-up -----------------------------------------------------------------------------------------
-// LK's power-off notify leaves the device in UFS-PowerDown and a host power-mode change pending (handoff HCS.UPMCRS=
-// PWR_LOCAL). UIC DME commands still complete in that state, so the prelink writes answer, but UPIUs other than the
-// wake SSU are ignored (diag84: NOP OUT -> OCS 5 PEER_COMM_FAILURE). The MTK UEFI driver powers the host controller
-// through an enable cycle and runs three DME writes before every link startup; without them the PA layer rejects the
-// link. Attributes are encoded as UIC_ARG_MIB(value) = value << 16, as in Linux ufs-mediatek and UfsMtkDxe.
+// LK's power-off notify cuts the device rails and parks the link: diag85 showed every UIC DME command completing while
+// LINKSTARTUP returned result 1 on all six attempts and the SSU to 0xD0 got OCS 5, i.e. there was no device on the
+// wire. The MTK UEFI driver powers the device back through an EL3 SMC call set (MTCMOS, SRAM, rails with a reset
+// pulse), releases the PDN/AO resets, unisolates the M-PHY, requests REFCLK and enables XOUFS before the link
+// startup. Attributes are encoded as UIC_ARG_MIB(value) = value << 16, as in Linux ufs-mediatek and UfsMtkDxe.
+
+// MTK_SIP_UFS_CONTROL through the secure monitor, the call set UfsMtkDxe makes at PreHce. The returned x0 is the
+// per-call status; callers record it, since a command the EL3 firmware does not know comes back non-zero.
+static uint32_t mtkSmc (uint32_t command, uint32_t arg1, uint32_t arg2)
+{
+  register uint64_t x0 __asm__ ("x0") = 0x82000276ULL;
+  register uint64_t x1 __asm__ ("x1") = command;
+  register uint64_t x2 __asm__ ("x2") = arg1;
+  register uint64_t x3 __asm__ ("x3") = arg2;
+  __asm__ volatile ("smc #0" : "+r" (x0) : "r" (x1), "r" (x2), "r" (x3)
+                    : "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17",
+                      "cc", "memory");
+  return static_cast<uint32_t> (x0);
+}
+
+// Power the UFS stack up the way UfsMtkDxe does before HCE: EL3 turns MTCMOS and SRAM on and gives the device rails
+// a reset pulse, then the PDN/AO reset lines are released, the M-PHY leaves isolation, the 26 MHz reference is
+// requested and XOUFS enabled. Without this the link startup has no peer to talk to.
+static void hostMtkPowerUp (void)
+{
+  gRootDiagnostic.smc[0] = mtkSmc (1u << 9, 1, 0);        // MTCMOS on
+  gRootDiagnostic.smc[1] = mtkSmc (1u << 5, 1, 0);        // UFS SRAM on
+  gRootDiagnostic.smc[2] = mtkSmc (1u << 7, 1, 0x310);    // device rails on
+  IODelay (2000);
+  gRootDiagnostic.smc[3] = mtkSmc (1u << 1, 0, 0);        // device reset assert
+  IODelay (20);
+  gRootDiagnostic.smc[4] = mtkSmc (1u << 1, 1, 0);        // device reset deassert
+  IODelay (12000);
+
+  OSSharedPtr<IOMemoryMap> pdnMap, aoMap, phyMap;
+  uintptr_t pdn = mapPhys (UFS_PDN_BASE, 0x1000, pdnMap);
+  uintptr_t ao = mapPhys (UFS_AO_BASE, 0x1000, aoMap);
+  uintptr_t phy = mapPhys (UFS_PHY_BASE, UFS_PHY_SIZE, phyMap);
+  if (pdn) {
+    write32 (pdn, 0x4c, 0x1);   // unipro
+    IODelay (20);
+    write32 (pdn, 0x4c, 0x2);   // crypto
+    IODelay (20);
+    write32 (pdn, 0x4c, 0x4);   // hci
+    IODelay (20);
+  }
+  if (ao) {
+    write32 (ao, 0x4c, 0x100);  // mphy
+    IODelay (200);
+  }
+  if (phy) {
+    uint32_t reg = read32 (phy, 0x8c);   // PLL and CDR out of isolation, RX squelch on
+    write32 (phy, 0x8c, (reg | (1u << 11)) & ~((1u << 10) | (1u << 9) | (1u << 8)));
+    reg = read32 (phy, 0xb044);
+    write32 (phy, 0xb044, (reg | (1u << 18)) & ~((1u << 20) | (1u << 19) | (1u << 17)));
+    reg = read32 (phy, 0xa0ac);
+    write32 (phy, 0xa0ac, (reg | (1u << 1)) & ~1u);
+    IODelay (10);
+    write32 (phy, 0xa09c, read32 (phy, 0xa09c) & ~(1u << 18));   // release the DIFZ force
+    IODelay (10);
+    gRootDiagnostic.phy8c = read32 (phy, 0x8c);
+  }
+  write32 (gHost.hc, 0x144, read32 (gHost.hc, 0x144) | 1);       // REFCLK_REQUEST
+  uint32_t ack = 0, reg = 0;
+  for (unsigned attempt = 0; attempt < 300; ++attempt) {
+    reg = read32 (gHost.hc, 0x144);
+    ack = ((reg >> 1) & 1) == (reg & 1);                          // REFCLK_ACK follows REQUEST
+    if (ack) break;
+    IODelay (10);
+  }
+  gRootDiagnostic.phyAck = ack;
+  write32 (gHost.hc, 0x140, read32 (gHost.hc, 0x140) | 0x80);    // XOUFS enable
+  gRootDiagnostic.xoufs2 = read32 (gHost.hc, 0x140);
+  gRootDiagnostic.aoStatus2 = ao ? read32 (ao, 0x04) : 0xffffffff;
+  gRootDiagnostic.pdnStatus2 = pdn ? read32 (pdn, 0x04) : 0xffffffff;
+}
+
 static bool hostWaitMaskFor (unsigned offset, uint32_t mask, uint32_t value, uint32_t timeoutUs)
 {
   uint64_t deadline;

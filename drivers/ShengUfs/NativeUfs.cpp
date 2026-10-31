@@ -289,9 +289,11 @@ static bool hostBringUp (const char **why)
     if (!hostStartQueue (why)) return false;
   } else {
     // HCE stays on: cycle only if the handoff left it off, then quiet the
-    // queue and walk the UniPro link back up. LK's power-off notify leaves a
-    // host power-mode change pending (HCS.UPMCRS=PWR_LOCAL), so the wake ladder
-    // runs before the MTK prelink attributes and the link startup.
+    // queue and walk the UniPro link back up. LK's power-off notify cuts the
+    // device rails and leaves a host power-mode change pending, so the MTK
+    // power-up and the wake ladder run before the prelink and link startup.
+    gRootDiagnostic.stage = "mtk power up";
+    hostMtkPowerUp ();
     gRootDiagnostic.stage = "host controller enable";
     if (!hostEnableController (why)) return false;
     gRootDiagnostic.stage = "request list";

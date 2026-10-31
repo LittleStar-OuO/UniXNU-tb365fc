@@ -26,6 +26,9 @@ struct UfsRootDiagnostics {
   uint32_t retryReset = 0xffffffff, retryHib = 0xffffffff, retryPowerOn = 0xffffffff, retryEnable = 0xffffffff;
   uint32_t wakeResult = 0xffffffff, wakeOcs = 0xff, wakeScsi = 0xffff;
   uint32_t xoufs = 0, refclk = 0, aoStatus = 0, aoReset = 0, pdnStatus = 0, pdnReset = 0;
+  uint32_t smc[5] = { 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff };
+  uint32_t phy8c = 0xffffffff, phyAck = 0xffffffff, xoufs2 = 0xffffffff;
+  uint32_t aoStatus2 = 0xffffffff, pdnStatus2 = 0xffffffff;
 };
 
 static inline int formatUfsRootDiagnostics(char *buffer, size_t capacity,
@@ -46,6 +49,7 @@ static inline int formatUfsRootDiagnostics(char *buffer, size_t capacity,
     "LINK wake=%x,%x,%x codes=%x,%x,%x round=%u retry=%x,%x,%x,%x ok=%u\n"
     "WAKE ssu=%08x/%02x/%04x\n"
     "PWR ao=%08x/%08x pdn=%08x/%08x xo=%08x rc=%08x\n"
+    "MTK smc=%x,%x,%x,%x,%x phy=%08x ack=%x xo=%08x ao=%08x pdn=%08x\n"
     "GPT/read lba=%llx userdata=%llx..%llx magic=%08x %08x manifest=%u\n"
     "WINDOWS found=%u prepared=%u published=%u bytes=%llx policies=%llu verify=%08x\n"
     "IO reads=%llu failures=%llu pubPhase=%u window=%u\n",
@@ -62,6 +66,8 @@ static inline int formatUfsRootDiagnostics(char *buffer, size_t capacity,
     d.retryReset, d.retryHib, d.retryPowerOn, d.retryEnable, d.linkOk,
     d.wakeResult, d.wakeOcs, d.wakeScsi,
     d.aoStatus, d.aoReset, d.pdnStatus, d.pdnReset, d.xoufs, d.refclk,
+    d.smc[0], d.smc[1], d.smc[2], d.smc[3], d.smc[4],
+    d.phy8c, d.phyAck, d.xoufs2, d.aoStatus2, d.pdnStatus2,
     (unsigned long long)d.lba, (unsigned long long)d.first, (unsigned long long)d.last,
     d.magic0, d.magic1, d.manifest, d.windows, d.prepared, d.published,
     (unsigned long long)d.windowBytes, (unsigned long long)d.policyCount, d.verify,
