@@ -1,0 +1,99 @@
+schema_version = 2
+
+[board]
+# Local bring-up copy (not committed). The published UniXNU-tb365fc keeps
+# example = true until the APFS Data volume UUID is measured on the tablet.
+example = false
+name = "tb365fc"
+soc = "MT6835"
+soc_source = "mt6835"
+os_profile = "ipados-17.7.11-21H461"
+description = "Lenovo Xiaoxin Pad 12.1 (2025), Lenovo TB365FC (board cava_prc_consumer_wifi)"
+kit = "tb365fc"
+
+[components]
+# Storage is the MT6835 fork of ShengUfs (drivers/ShengUfs, local.toml override); it
+# keeps the official build recipe and transport headers, with the MTK host window.
+include = ["ArmDTPlatform", "ArmCpu", "SoftwareAES", "XnuPrelink", "DarwinBoot", "ShengUfs"]
+
+[kernel]
+defconfig = "tb365fc_defconfig"
+config_fragments = ["arch:configs/common.config", "soc:configs/mt6835.config", "os:configs/ipados.config"]
+patch_series = ["arch:patches/xnu/series", "soc:patches/xnu/series", "os:patches/xnu/series", "device:patches/xnu/series"]
+# Same ordered archive list as the arm64 profile (board lists replace, not append),
+# with the MT6835 UFS driver added; it pulls VirtioMmioBlock and VerifiedRoot in.
+archives = [
+  "build-corecrypto-14.py",
+  "build-corecrypto-14.py --namespace",
+  "component:ArmDTPlatform",
+  "component:ArmCpu",
+  "component:SoftwareAES",
+  "build-software-aes-bindings.py",
+  "build-mockfs-fixture.py",
+  "build-libpthread-kernel.py",
+  "component:ShengUfs",
+  "build-ufs-bindings.py",
+]
+
+[device_tree]
+source = "device:dts/tb365fc.dts"
+include_dirs = ["soc:dts"]
+
+[firmware]
+# Paths inside the uefi-tb365fc checkout (--uefi).
+config = "tb365fc"
+dsc = "Platforms/Lenovo/tb365fcPkg/tb365fc.dsc"
+fd = "Build/tb365fcPkg/{target}_CLANGPDB/FV/SILICIUM_UEFI.fd"
+submodules = [
+  "Common/Mu",
+  "Common/Mu_OEM_Sample",
+  "Mu_Basecore",
+  "Silicon/Silicium/OpensslPkg/Library/OpensslLib/openssl",
+]
+packages = [
+  "{uefi}",
+  "{uefi}/Platforms/Lenovo",
+  "{uefi}/Silicon/MediaTek",
+  "{uefi}/Silicon/Silicium",
+  "{tree}/package",
+  "{tree}/drivers/DarwinBoot",
+  "{edk2}",
+  "{uefi}/Common/Mu",
+  "{uefi}/Common/Mu_OEM_Sample",
+]
+
+[firmware.defines]
+DEVICE_MODEL = "TB365FC"
+
+[userdata]
+# Measured from the on-device GPT: the UFS LUN exposes 4096-byte logical sectors and
+# userdata runs from LBA 0x34C800 to 0x1DC8FF7 (111,091,680 KiB). The byte offset
+# matches the stock scatter's 0x34C800000.
+first_lba = 0x34C800
+last_lba = 0x1DC8FF7
+lba_bytes = 4096
+windows = [
+  { name = "OS", component = "OS" },
+  { name = "SystemOS", component = "Cryptex1,SystemOS" },
+]
+
+[payload]
+volume = "TB365FC"
+# boot_a is 64 MiB and LK loads the ramdisk at 0x66F00000 into the 64 MiB
+# "Boot Ramdisk" reservation, so the FAT payload must stay below both.
+size_mib = 56
+loader = "firmware"
+title = "UniXNU"
+kernel_args = ["-v", "serial=3", "debug=0x14e", "-enable_kprintf_spam", "sheng-pmgr=2", "native-ufs-root=1", "native-ufs-diagnostics=1"]
+
+[payload.adt]
+# A stable software identity seed for this board, not an Apple silicon chip ID.
+chip_id = "0x365FC"
+# Supply the unique 64-bit id through --unique-chip-id.
+unique_chip_id = "required"
+# Root volume of the OS window (044-76040-038.dmg, iPad7,1 17.7.11): the UUID the
+# APFS media publishes, as recorded by UniXNU's owner-policy tooling for this IPSW.
+root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"
+# Continuous DarwinBoot window, 256 MiB; accepted range is 256 MiB to 8 GiB in 2 MiB steps.
+owned_memory_size = "0x10000000"
+psci_method = "smc"

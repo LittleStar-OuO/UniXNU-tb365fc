@@ -1,0 +1,21 @@
+# Kernel configuration of the TB365FC bootstrap image.
+# CONFIG_XNU_<NAME> becomes XNU_<NAME>; y and n are 1 and 0, quoted values pass through.
+#
+# The ARM64 profile already enables the source kernel, software AES, architected timer,
+# mockfs and panic paths. This file only records board/SoC decisions that differ.
+
+CONFIG_XNU_ARM_DT_PLATFORM=y
+CONFIG_XNU_ARMCPU=y
+CONFIG_XNU_NATIVE_ARCH_TIMER=y
+CONFIG_XNU_NATIVE_PAN=y
+CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
+CONFIG_XNU_ARMVIRT_PLATFORM=n
+# AMFI's ConfigurationSettings requires an ApplePMGRNub; the linked nub in
+# kits/tb365fc/SiriusPmgr.cpp satisfies the latch (boot arg sheng-pmgr=2).
+CONFIG_XNU_SHENG_PMGR=y
+# MT6835 UFS controller (ufshci@112b0000) as a read-only IOBlockStorageDevice;
+# root mode is enabled by the native-ufs-root=1 boot argument.
+CONFIG_XNU_NATIVE_UFS=y
+
+# Display, input and GPU gates are added area by area once the hardware
+# inventory in porting.toml is complete.
