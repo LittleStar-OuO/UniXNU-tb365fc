@@ -122,8 +122,10 @@ IOService *NativeUfs::probe (IOService *provider, SInt32 *score)
   return this;
 }
 
-// The controller window is the MT6835 DT's ufshci@112b0000 range. The firmware (LK)
-// leaves the link running; this driver only maps it and takes the request list over.
+// The controller window is the MT6835 DT's ufshci@112b0000 range. LK hands the
+// controller over enabled but with the UniPro link parked by its power-off
+// notify; the driver maps it and takes the request list over after the link is
+// walked back up.
 static uintptr_t mapPhys (uint64_t phys, uint64_t length, OSSharedPtr<IOMemoryMap> &keep)
 {
   IODeviceMemory *memory = IODeviceMemory::withRange (phys, length);
@@ -240,6 +242,17 @@ static bool hostBringUp (const char **why)
     gRootDiagnostic.entryHce = gRootDiagnostic.hce;
     gRootDiagnostic.entryIs = read32 (gHost.hc, 0x20);
     for (unsigned i = 0; i < 5; ++i) gRootDiagnostic.entryUic[i] = read32 (gHost.hc, 0x38 + 4 * i);
+    // Read-only power evidence: whether LK's power-off notify also gated the DFS/PDN
+    // blocks and the PHY reference clock, or only parked the link.
+    gRootDiagnostic.xoufs = read32 (gHost.hc, 0x140);
+    gRootDiagnostic.refclk = read32 (gHost.hc, 0x144);
+    OSSharedPtr<IOMemoryMap> aoMap, pdnMap;
+    uintptr_t ao = mapPhys (UFS_AO_BASE, 0x1000, aoMap);
+    uintptr_t pdn = mapPhys (UFS_PDN_BASE, 0x1000, pdnMap);
+    gRootDiagnostic.aoStatus = ao ? read32 (ao, 0x04) : 0xffffffff;
+    gRootDiagnostic.aoReset = ao ? read32 (ao, 0x4c) : 0xffffffff;
+    gRootDiagnostic.pdnStatus = pdn ? read32 (pdn, 0x04) : 0xffffffff;
+    gRootDiagnostic.pdnReset = pdn ? read32 (pdn, 0x4c) : 0xffffffff;
   }
   gRootDiagnostic.stage = "DMA allocation";
   gHost.dma = IOBufferMemoryDescriptor::inTaskWithOptions (
@@ -276,22 +289,44 @@ static bool hostBringUp (const char **why)
     if (!hostStartQueue (why)) return false;
   } else {
     // HCE stays on: cycle only if the handoff left it off, then quiet the
-    // queue and wake the parked UniPro link the way the MTK driver does.
+    // queue and walk the UniPro link back up. LK's power-off notify leaves a
+    // host power-mode change pending (HCS.UPMCRS=PWR_LOCAL), so the wake ladder
+    // runs before the MTK prelink attributes and the link startup.
     gRootDiagnostic.stage = "host controller enable";
     if (!hostEnableController (why)) return false;
     gRootDiagnostic.stage = "request list";
     if (!hostStopQueue (why)) return false;
+    gRootDiagnostic.stage = "link wake";
+    hostLinkWake ();
     gRootDiagnostic.stage = "link prelink";
     hostLinkPrelink ();
     gRootDiagnostic.stage = "link startup";
     bool linked = hostLinkStartup (why);
+    if (!linked) {
+      gRootDiagnostic.stage = "link retry";
+      hostLinkRetry ();
+      hostLinkPrelink ();
+      gRootDiagnostic.stage = "link startup";
+      linked = hostLinkStartup (why);
+    }
     for (unsigned i = 0; i < 5; ++i) gRootDiagnostic.uic[i] = read32 (gHost.hc, 0x38 + 4 * i);
-    if (!linked) return false;
+    gRootDiagnostic.linkOk = linked ? 1 : 0;
+    // HCS.DP is stale in both directions, so a failed startup still proceeds: the device wake
+    // below is the one UPIU a powered-down device answers, and it decides whether the link
+    // recovered. A dead link then fails at the request list or the wake itself.
     gRootDiagnostic.stage = "request list";
     if (!hostStartQueue (why)) return false;
   }
+  // The handoff leaves the device in UFS-PowerDown, where every UPIU but SSU is dropped
+  // (diag84's NOP OUT got OCS 5 PEER_COMM_FAILURE). Wake it to Active before the NOP proof.
+  gRootDiagnostic.stage = "device wake";
+  if (hostWakeDevice () != kIOReturnSuccess) {
+    gHost.ready = false;
+    *why = "device wake (START STOP UNIT)";
+    return false;
+  }
   gRootDiagnostic.stage = "NOP OUT";
-  // NOP OUT proves the transport before touching the SCSI layer.
+  // NOP OUT proves the UPIU path before touching the SCSI layer.
   if (hostNop () != kIOReturnSuccess) {
     gHost.ready = false;
     *why = "NOP OUT";
@@ -307,10 +342,8 @@ static bool hostBringUp (const char **why)
   gRootDiagnostic.power = power;
   if ((power & 0xff) != 0x11) {
     gRootDiagnostic.stage = "device wake";
-    // START STOP UNIT, power condition ACTIVE, to the UFS Device well-known LU (as Linux resumes).
-    uint8_t ssu[6] = { 0x1b, 0, 0, 0, 0x10, 0 };
-    uint32_t scsi = 0;
-    if (hostScsi (0xd0, ssu, 6, false, 0, 500000, &scsi) != kIOReturnSuccess) {
+    // Still not Active (bCurrentPowerMode != 0x11): repeat the SSU wake, as Linux resumes.
+    if (hostWakeDevice () != kIOReturnSuccess) {
       gHost.ready = false;
       *why = "wake (START STOP UNIT)";
       return false;

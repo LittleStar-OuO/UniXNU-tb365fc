@@ -130,8 +130,9 @@ static IOReturn hostProtocolError (uint32_t reason)
 }
 
 // ---- MTK UIC link bring-up -----------------------------------------------------------------------------------------
-// The firmware hands the controller over with the UniPro link parked (the MTK power-down state), so a warm NOP OUT is
-// rejected by the PA layer (UECPA 0x10) with a data-link replay timeout. The MTK UEFI driver powers the host controller
+// LK's power-off notify leaves the device in UFS-PowerDown and a host power-mode change pending (handoff HCS.UPMCRS=
+// PWR_LOCAL). UIC DME commands still complete in that state, so the prelink writes answer, but UPIUs other than the
+// wake SSU are ignored (diag84: NOP OUT -> OCS 5 PEER_COMM_FAILURE). The MTK UEFI driver powers the host controller
 // through an enable cycle and runs three DME writes before every link startup; without them the PA layer rejects the
 // link. Attributes are encoded as UIC_ARG_MIB(value) = value << 16, as in Linux ufs-mediatek and UfsMtkDxe.
 static bool hostWaitMaskFor (unsigned offset, uint32_t mask, uint32_t value, uint32_t timeoutUs)
@@ -217,8 +218,37 @@ static void hostLinkPrelink (void)
   }
 }
 
+// LK's power-off notify leaves a host power-mode change pending: the handoff shows
+// HCS.UPMCRS=PWR_LOCAL and a link startup in that state returns UIC failure 1 while a
+// DME_GET/SET still answers. Exit hibernate, power the UniPro stack on and enable it.
+static void hostLinkWake (void)
+{
+  uint32_t code = 0xffffffff, value = 0;
+  hostUicCommand (0x18, 0, 0, 2000000, &code, &value);   // DME_HIBERNATE_EXIT
+  gRootDiagnostic.wakeHib = code;
+  hostUicCommand (0x10, 0, 0, 2000000, &code, &value);   // DME_POWERON
+  gRootDiagnostic.wakePowerOn = code;
+  hostUicCommand (0x12, 0, 0, 2000000, &code, &value);   // DME_ENABLE
+  gRootDiagnostic.wakeEnable = code;
+}
+
+// Second rung after a failed startup round: reset the peer UniPro endpoint and repeat the wake ladder.
+static void hostLinkRetry (void)
+{
+  uint32_t code = 0xffffffff, value = 0;
+  hostUicCommand (0x15, 0, 0, 2000000, &code, &value);   // DME_ENDPOINT_RESET
+  gRootDiagnostic.retryReset = code;
+  hostUicCommand (0x18, 0, 0, 2000000, &code, &value);
+  gRootDiagnostic.retryHib = code;
+  hostUicCommand (0x10, 0, 0, 2000000, &code, &value);
+  gRootDiagnostic.retryPowerOn = code;
+  hostUicCommand (0x12, 0, 0, 2000000, &code, &value);
+  gRootDiagnostic.retryEnable = code;
+}
+
 static bool hostLinkStartup (const char **why)
 {
+  gRootDiagnostic.linkRound++;
   for (unsigned attempt = 1; attempt <= 3; ++attempt) {
     uint32_t code = 0xffffffff, value = 0;
     hostUicCommand (0x16, 0, 0, 3000000, &code, &value);              // DME_LINKSTARTUP
@@ -227,7 +257,10 @@ static bool hostLinkStartup (const char **why)
     gRootDiagnostic.linkAttempts = attempt;
     gRootDiagnostic.linkHcs = hcs;
     gRootDiagnostic.linkInterrupt = read32 (gHost.hc, 0x20);
-    if (hcs & 1) {                                                    // HCS.DP: device present
+    gRootDiagnostic.linkCodes[attempt - 1] = code;
+    // HCS.DP alone proves nothing: the handoff leaves it set from LK's own link. The link
+    // only counts as up when the UIC command succeeded and the device reports present.
+    if (code == 0 && (hcs & 1)) {
       uint32_t pending = read32 (gHost.hc, 0x20);
       if (pending) hostWrite (0x20, pending);
       return true;
@@ -317,6 +350,21 @@ static IOReturn hostScsi (uint8_t lun, const uint8_t *cdb, unsigned cdbLength, b
 {
   if (dataBytes && !toHost) { *scsiStatus = 0xffff; return kIOReturnBadArgument; }
   return hostScsiDir (lun, cdb, cdbLength, dataBytes ? 2U : 0U, dataBytes, timeoutUs, scsiStatus);
+}
+
+// START STOP UNIT, power condition ACTIVE (1h in the high nibble, as Linux ufshcd_set_dev_pwr_mode), to the UFS
+// Device well-known LU (0xD0). A device in UFS-PowerDown answers this command and ignores every other UPIU, so the
+// wake must precede the NOP OUT; on a clean handoff it is a no-op transition. IMMED stays 0: the command completes
+// only once the device is Active.
+static IOReturn hostWakeDevice (void)
+{
+  static const uint8_t ssu[6] = { 0x1b, 0, 0, 0, 0x10, 0 };
+  uint32_t scsi = 0xffff;
+  IOReturn result = hostScsi (0xd0, ssu, 6, false, 0, 3000000, &scsi);
+  gRootDiagnostic.wakeResult = static_cast<uint32_t> (result);
+  gRootDiagnostic.wakeOcs = gRootDiagnostic.ocs;
+  gRootDiagnostic.wakeScsi = scsi;
+  return result;
 }
 
 // Query read request (opcode 0x03 READ ATTRIBUTE / 0x05 READ FLAG). Returns the value field.

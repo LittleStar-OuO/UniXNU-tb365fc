@@ -21,6 +21,11 @@ struct UfsRootDiagnostics {
   uint32_t entryIs = 0, entryUic[5] = {}, entryHcs = 0, entryHce = 0;
   uint32_t preSet[3] = { 0xffffffff, 0xffffffff, 0xffffffff }, preSet3 = 0xffffffff, savePower = 0;
   uint32_t linkResult = 0xffffffff, linkAttempts = 0, linkHcs = 0, linkInterrupt = 0;
+  uint32_t wakeHib = 0xffffffff, wakePowerOn = 0xffffffff, wakeEnable = 0xffffffff;
+  uint32_t linkCodes[3] = { 0xffffffff, 0xffffffff, 0xffffffff }, linkRound = 0, linkOk = 0;
+  uint32_t retryReset = 0xffffffff, retryHib = 0xffffffff, retryPowerOn = 0xffffffff, retryEnable = 0xffffffff;
+  uint32_t wakeResult = 0xffffffff, wakeOcs = 0xff, wakeScsi = 0xffff;
+  uint32_t xoufs = 0, refclk = 0, aoStatus = 0, aoReset = 0, pdnStatus = 0, pdnReset = 0;
 };
 
 static inline int formatUfsRootDiagnostics(char *buffer, size_t capacity,
@@ -38,6 +43,9 @@ static inline int formatUfsRootDiagnostics(char *buffer, size_t capacity,
     "UIC pa=%08x dl=%08x net=%08x tr=%08x dme=%08x\n"
     "LINK entry is=%08x hcs=%08x hce=%x uic=%x,%x,%x,%x,%x\n"
     "LINK pre=%x,%x sp=%x set=%x ls=%x/%u hcs=%08x is=%08x\n"
+    "LINK wake=%x,%x,%x codes=%x,%x,%x round=%u retry=%x,%x,%x,%x ok=%u\n"
+    "WAKE ssu=%08x/%02x/%04x\n"
+    "PWR ao=%08x/%08x pdn=%08x/%08x xo=%08x rc=%08x\n"
     "GPT/read lba=%llx userdata=%llx..%llx magic=%08x %08x manifest=%u\n"
     "WINDOWS found=%u prepared=%u published=%u bytes=%llx policies=%llu verify=%08x\n"
     "IO reads=%llu failures=%llu pubPhase=%u window=%u\n",
@@ -50,6 +58,10 @@ static inline int formatUfsRootDiagnostics(char *buffer, size_t capacity,
     d.smmuId2, d.cba2r, d.uic[0], d.uic[1], d.uic[2], d.uic[3], d.uic[4],
     d.entryIs, d.entryHcs, d.entryHce, d.entryUic[0], d.entryUic[1], d.entryUic[2], d.entryUic[3], d.entryUic[4],
     d.preSet[0], d.preSet[1], d.savePower, d.preSet3, d.linkResult, d.linkAttempts, d.linkHcs, d.linkInterrupt,
+    d.wakeHib, d.wakePowerOn, d.wakeEnable, d.linkCodes[0], d.linkCodes[1], d.linkCodes[2], d.linkRound,
+    d.retryReset, d.retryHib, d.retryPowerOn, d.retryEnable, d.linkOk,
+    d.wakeResult, d.wakeOcs, d.wakeScsi,
+    d.aoStatus, d.aoReset, d.pdnStatus, d.pdnReset, d.xoufs, d.refclk,
     (unsigned long long)d.lba, (unsigned long long)d.first, (unsigned long long)d.last,
     d.magic0, d.magic1, d.manifest, d.windows, d.prepared, d.published,
     (unsigned long long)d.windowBytes, (unsigned long long)d.policyCount, d.verify,
