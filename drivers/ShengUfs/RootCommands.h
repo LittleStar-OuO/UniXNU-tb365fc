@@ -30,6 +30,9 @@ static uint32_t loadBe32 (const uint8_t *at)
 // the UTRD data direction (0 none, 1 from host, 2 to host). Direction 1 is reachable only through hostWrite4k, which
 // confines it to the persistent store window. Returns the overall command status
 // (0 = completed) in *ocs. Timeout/fatal status quarantines the allocation.
+// diag93 diagnostic only: moves the PRD destination inside the allocation to test address dependence.
+static uint64_t gProbeDataShift = 0;
+
 static IOReturn hostSubmit (uint32_t direction, uint32_t dataBytes, uint32_t timeoutUs, uint32_t *ocs)
 {
   *ocs = 15;
@@ -68,20 +71,52 @@ static IOReturn hostSubmit (uint32_t direction, uint32_t dataBytes, uint32_t tim
   words[6] = (512U >> 2) | ((kRspOffset >> 2) << 16);
   words[7] = (dataBytes ? 1U : 0U) | ((kPrdtOffset >> 2) << 16);
   if (dataBytes) {
-    uint64_t dataPhys = gHost.phys + kDataOffset;
+    uint64_t dataPhys = gHost.phys + kDataOffset + gProbeDataShift;
     uint32_t *prd = reinterpret_cast<uint32_t *> (gHost.virt + kUcdOffset + kPrdtOffset);
     prd[0] = static_cast<uint32_t> (dataPhys);
     prd[1] = static_cast<uint32_t> (dataPhys >> 32);
     prd[2] = 0;
     prd[3] = dataBytes - 1;
   }
-  cacheCivac (gHost.virt, kDataOffset + dataBytes);
+  size_t syncBytes = static_cast<size_t> (kDataOffset + gProbeDataShift + dataBytes);
+  cacheCivac (gHost.virt, syncBytes);
   hostWrite (0x20, 1);  // Acknowledge completion only; preserve error evidence.
   HardwareTransferPort port;
+  static unsigned d112Submits = 0;
+  static unsigned d114Submits = 0;
+  bool verb = d112Submits < 16;
+  if (verb) {
+    d112Submits++;
+    kprintf ("d112 hs%u pre db=%x is=%x t=%llx\n", d112Submits,
+        read32 (gHost.hc, 0x58), read32 (gHost.hc, 0x20), mach_absolute_time ());
+  } else if ((++d114Submits & 255) == 0) {
+    // diag114: silent submits hid where the root I/O loop went. Every 256th one
+    // names opcode, LUN, direction, bytes and LBA (READ/WRITE 10/16).
+    const uint8_t *cdb = reinterpret_cast<const uint8_t *> (gHost.virt) + kUcdOffset + 16;
+    uint32_t op = gRootDiagnostic.opcode;
+    uint64_t lba = 0;
+    if (op == 0x28 || op == 0x2a) {
+      lba = (uint64_t (loadBe32 (cdb + 2)) << 8) | cdb[6];
+    } else if (op == 0x88 || op == 0x8a) {
+      lba = (uint64_t (loadBe32 (cdb + 2)) << 32) | loadBe32 (cdb + 6);
+    }
+    kprintf ("d114 s%u op=%x lun=%u dir=%u n=%u lba=%llx t=%llx\n", d114Submits,
+        op, gRootDiagnostic.lun, direction, dataBytes, lba, mach_absolute_time ());
+  }
+  // Arm the 200 ms budget after the diagnostic print: rendering the console
+  // line can consume the whole deadline while the doorbell is still 0.
   clock_interval_to_deadline (timeoutUs, kMicrosecondScale, &port.deadline);
   hostWrite (0x58, 1);
   UfsTransferPoll state;
   UfsTransferEnd end = pollUfsTransfer (port, state);
+  if (verb) {
+    kprintf ("d112 hs%u end=%d ocs=%x polls=%u db=%x\n", d112Submits,
+        static_cast<int> (end), state.ocs, state.polls, state.doorbellSeen);
+  } else if (end != UfsTransferEnd::Completed || state.ocs != 0) {
+    kprintf ("d114 bad end=%d ocs=%x polls=%u db=%x op=%x n=%u t=%llx\n",
+        static_cast<int> (end), state.ocs, state.polls, state.doorbellSeen,
+        gRootDiagnostic.opcode, dataBytes, mach_absolute_time ());
+  }
   gRootDiagnostic.polls = state.polls;
   gRootDiagnostic.dbSeen = state.doorbellSeen;
   gRootDiagnostic.isSeen = state.interruptSeen;
@@ -93,7 +128,7 @@ static IOReturn hostSubmit (uint32_t direction, uint32_t dataBytes, uint32_t tim
     gHost.ready = false;
     return recordTransport (end == UfsTransferEnd::Timeout ? kIOReturnTimeout : kIOReturnIOError, *ocs);
   }
-  cacheInvalidate (gHost.virt, kDataOffset + dataBytes);
+  cacheInvalidate (gHost.virt, syncBytes);
   gRootDiagnostic.response = loadBe32 (gHost.virt + kUcdOffset + kRspOffset);
   return recordTransport (*ocs == 0 ? kIOReturnSuccess : kIOReturnIOError, *ocs);
 }
@@ -153,49 +188,53 @@ static uint32_t mtkSmc (uint32_t command, uint32_t arg1, uint32_t arg2)
 // REFCLK request and XOUFS enable, rerun after an HCE reset in case the reset cleared them.
 static void hostMtkClockOn (void)
 {
+  kprintf ("d109 q0 m=%llx\n", mach_absolute_time ());
   write32 (gHost.hc, 0x144, read32 (gHost.hc, 0x144) | 1);       // REFCLK_REQUEST
+  kprintf ("d109 q1\n");
   uint32_t ack = 0, reg = 0;
-  for (unsigned attempt = 0; attempt < 300; ++attempt) {
+  unsigned attempt = 0;
+  for (; attempt < 300; ++attempt) {
     reg = read32 (gHost.hc, 0x144);
     ack = ((reg >> 1) & 1) == (reg & 1);                          // REFCLK_ACK follows REQUEST
     if (ack) break;
     IODelay (10);
   }
+  kprintf ("d109 q2 ack=%u n=%u reg=%x\n", ack, attempt, reg);
   gRootDiagnostic.phyAck = ack;
   write32 (gHost.hc, 0x140, read32 (gHost.hc, 0x140) | 0x80);    // XOUFS enable
   gRootDiagnostic.xoufs2 = read32 (gHost.hc, 0x140);
+  kprintf ("d109 q3 x=%x\n", gRootDiagnostic.xoufs2);
 }
 
-// Power the UFS stack up the way UfsMtkDxe does before HCE: EL3 turns MTCMOS and SRAM on and gives the device rails
-// a reset pulse, then the PDN/AO reset lines are released, the M-PHY leaves isolation, the 26 MHz reference is
-// requested and XOUFS enabled. Without this the link startup has no peer to talk to.
+// Power the UFS device up the way UfsMtkDxe does before HCE: EL3 turns MTCMOS and SRAM on and gives the device rails
+// a reset pulse, then the M-PHY leaves isolation, the 26 MHz reference is requested and XOUFS enabled. The host-side
+// resets are released separately in hostResetController; without this the link startup has no peer to talk to.
 static void hostMtkPowerUp (void)
 {
+  kprintf ("d113 u0 m=%llx\n", mach_absolute_time ());
   gRootDiagnostic.smc[0] = mtkSmc (1u << 9, 1, 0);        // MTCMOS on
+  kprintf ("d113 u1 s=%x m=%llx\n", gRootDiagnostic.smc[0], mach_absolute_time ());
   gRootDiagnostic.smc[1] = mtkSmc (1u << 5, 1, 0);        // UFS SRAM on
+  kprintf ("d113 u2 s=%x m=%llx\n", gRootDiagnostic.smc[1], mach_absolute_time ());
   gRootDiagnostic.smc[2] = mtkSmc (1u << 7, 1, 0x310);    // device rails on
+  kprintf ("d113 u3 s=%x m=%llx\n", gRootDiagnostic.smc[2], mach_absolute_time ());
   IODelay (2000);
   gRootDiagnostic.smc[3] = mtkSmc (1u << 1, 0, 0);        // device reset assert
+  kprintf ("d113 u4 s=%x m=%llx\n", gRootDiagnostic.smc[3], mach_absolute_time ());
   IODelay (20);
   gRootDiagnostic.smc[4] = mtkSmc (1u << 1, 1, 0);        // device reset deassert
+  kprintf ("d113 u5 s=%x m=%llx\n", gRootDiagnostic.smc[4], mach_absolute_time ());
   IODelay (12000);
+  kprintf ("d113 u6 m=%llx\n", mach_absolute_time ());
 
   OSSharedPtr<IOMemoryMap> pdnMap, aoMap, phyMap;
   uintptr_t pdn = mapPhys (UFS_PDN_BASE, 0x1000, pdnMap);
   uintptr_t ao = mapPhys (UFS_AO_BASE, 0x1000, aoMap);
   uintptr_t phy = mapPhys (UFS_PHY_BASE, UFS_PHY_SIZE, phyMap);
-  if (pdn) {
-    write32 (pdn, 0x4c, 0x1);   // unipro
-    IODelay (20);
-    write32 (pdn, 0x4c, 0x2);   // crypto
-    IODelay (20);
-    write32 (pdn, 0x4c, 0x4);   // hci
-    IODelay (20);
-  }
-  if (ao) {
-    write32 (ao, 0x4c, 0x100);  // mphy
-    IODelay (200);
-  }
+  // Read-only gate evidence. diag86 answered UFSHCI and UIC with status 0x04 = 0, so on this block 0 means the
+  // clocks are running; never touch set/clear 0x08/0x0c here (a wrong bit gates the whole controller).
+  gRootDiagnostic.gateAo = ao ? read32 (ao, 0x04) : 0xffffffff;
+  gRootDiagnostic.gatePdn = pdn ? read32 (pdn, 0x04) : 0xffffffff;
   if (phy) {
     uint32_t reg = read32 (phy, 0x8c);   // PLL and CDR out of isolation, RX squelch on
     write32 (phy, 0x8c, (reg | (1u << 11)) & ~((1u << 10) | (1u << 9) | (1u << 8)));
@@ -209,8 +248,10 @@ static void hostMtkPowerUp (void)
     gRootDiagnostic.phy8c = read32 (phy, 0x8c);
   }
   hostMtkClockOn ();
+  kprintf ("d113 u7 m=%llx\n", mach_absolute_time ());
   gRootDiagnostic.aoStatus2 = ao ? read32 (ao, 0x04) : 0xffffffff;
   gRootDiagnostic.pdnStatus2 = pdn ? read32 (pdn, 0x04) : 0xffffffff;
+  kprintf ("d113 u8 m=%llx\n", mach_absolute_time ());
 }
 
 static bool hostWaitMaskFor (unsigned offset, uint32_t mask, uint32_t value, uint32_t timeoutUs)
@@ -260,24 +301,90 @@ static IOReturn hostUicCommand (uint32_t opcode, uint32_t arg1, uint32_t arg3, u
 
 // The handoff leaves HCS.UPMCRS=PWR_LOCAL (LK's power-off notify stopped inside a power mode change) and a failed
 // SSU turns that into PWR_FATAL; UFSHCI names a host controller reset as the remedy for both, and it also clears
-// the stale request list. diag83 showed HCE never comes back from a 0->1 toggle until the vendor power-up sequence
-// has run, so this only runs after hostMtkPowerUp.
+// the stale request list. mainline ufs_mtk_host_reset asserts hci, crypto and unipro, waits ~100us and releases
+// unipro, crypto, hci in that order; the live mt6835 DT puts unipro on the AO block (mask 0x01) and crypto/hci on
+// the PDN block (masks 0x02/0x01). diag86/87 never released unipro, so HCE never came back after a 0->1 toggle.
+// XOUFS is set with HCE still 0, as ufs_mtk_hce_enable_notify does before the controller enable.
+static void hostMtkResetPulse (uintptr_t ao, uintptr_t pdn)
+{
+  kprintf ("d109 p0\n");
+  if (pdn) {
+    write32 (pdn, 0x48, read32 (pdn, 0x48) | 0x03);          // assert hci + crypto
+    write32 (pdn, 0x4c, read32 (pdn, 0x4c) & ~0x03u);
+  }
+  kprintf ("d109 pa\n");
+  if (ao) {
+    write32 (ao, 0x48, read32 (ao, 0x48) | 0x01);            // assert unipro
+    write32 (ao, 0x4c, read32 (ao, 0x4c) & ~0x01u);
+  }
+  kprintf ("d109 pb\n");
+  IODelay (110);
+  kprintf ("d109 pc\n");
+  if (ao) {
+    write32 (ao, 0x48, read32 (ao, 0x48) & ~0x01u);
+    write32 (ao, 0x4c, read32 (ao, 0x4c) | 0x01);            // release unipro
+  }
+  kprintf ("d109 pd\n");
+  if (pdn) {
+    write32 (pdn, 0x48, read32 (pdn, 0x48) & ~0x02u);
+    write32 (pdn, 0x4c, read32 (pdn, 0x4c) | 0x02);          // release crypto
+    IODelay (20);
+    write32 (pdn, 0x48, read32 (pdn, 0x48) & ~0x01u);
+    write32 (pdn, 0x4c, read32 (pdn, 0x4c) | 0x01);          // release hci
+  }
+  kprintf ("d109 pe\n");
+  IODelay (100);
+}
+
 static bool hostResetController (const char **why)
 {
-  hostWrite (0x34, 0);
-  if (!hostWaitMaskFor (0x34, 1, 0, 3000000)) {
-    *why = "host controller reset (HCE clear)";
-    return false;
+  OSSharedPtr<IOMemoryMap> aoMap, pdnMap;
+  kprintf ("d109 r0 m=%llx\n", mach_absolute_time ());
+  uintptr_t ao = mapPhys (UFS_AO_BASE, 0x1000, aoMap);
+  kprintf ("d109 r1 ao=%lx\n", (unsigned long)ao);
+  uintptr_t pdn = mapPhys (UFS_PDN_BASE, 0x1000, pdnMap);
+  kprintf ("d109 r1b pdn=%lx\n", (unsigned long)pdn);
+  // Polled driver: the interrupt line must never assert. LK left IE enabled and stale
+  // status set, and with no XNU handler a level-high UFS INT storms the GIC.
+  hostWrite (0x24, 0);
+  hostWrite (0x20, 0xffffffff);
+  kprintf ("d110 r1c ie=%x is=%x\n", read32 (gHost.hc, 0x24), read32 (gHost.hc, 0x20));
+  for (unsigned outer = 0; outer < 3; ++outer) {
+    hostWrite (0x34, 0);
+    kprintf ("d109 r2 m=%llx\n", mach_absolute_time ());
+    if (!hostWaitMaskFor (0x34, 1, 0, 3000000)) {
+      kprintf ("d109 r2f hce=%x\n", read32 (gHost.hc, 0x34));
+      *why = "host controller reset (HCE clear)";
+      return false;
+    }
+    kprintf ("d109 r3 hce=%x m=%llx\n", read32 (gHost.hc, 0x34) & 1, mach_absolute_time ());
+    gRootDiagnostic.hceClear = read32 (gHost.hc, 0x34) & 1;
+    hostMtkResetPulse (ao, pdn);
+    kprintf ("d109 r4 m=%llx\n", mach_absolute_time ());
+    hostMtkClockOn ();
+    kprintf ("d109 r5 m=%llx\n", mach_absolute_time ());
+    hostWrite (0x34, 1);
+    kprintf ("d109 r6 m=%llx\n", mach_absolute_time ());
+    IODelay (600);   // hba_enable_delay_us
+    kprintf ("d109 r6b hce=%x\n", read32 (gHost.hc, 0x34) & 1);
+    for (unsigned ms = 0; ms < 50 && !(read32 (gHost.hc, 0x34) & 1); ++ms) {
+      IODelay (1000);
+      if ((ms % 10) == 0) { kprintf ("d109 r6c %u hce=%x m=%llx\n", ms, read32 (gHost.hc, 0x34) & 1, mach_absolute_time ()); }
+    }
+    gRootDiagnostic.hceSet = read32 (gHost.hc, 0x34) & 1;
+    kprintf ("d109 r7 hce=%x m=%llx\n", gRootDiagnostic.hceSet, mach_absolute_time ());
+    if (gRootDiagnostic.hceSet) break;
   }
-  IODelay (10);
-  hostWrite (0x34, 1);
-  if (!hostWaitMaskFor (0x34, 1, 1, 3000000)) {
+  gRootDiagnostic.resetHce = read32 (gHost.hc, 0x34) & 1;
+  gRootDiagnostic.resetHcs = read32 (gHost.hc, 0x30);
+  kprintf ("d110 r8a hce=%x hcs=%x\n", gRootDiagnostic.resetHce, gRootDiagnostic.resetHcs);
+  uint32_t postIs = read32 (gHost.hc, 0x20);
+  kprintf ("d110 r8b is=%x\n", postIs);
+  kprintf ("d110 r8c ie=%x\n", read32 (gHost.hc, 0x24));
+  if (!gRootDiagnostic.resetHce) {
     *why = "host controller reset (HCE set)";
     return false;
   }
-  hostMtkClockOn ();
-  gRootDiagnostic.resetHce = read32 (gHost.hc, 0x34) & 1;
-  gRootDiagnostic.resetHcs = read32 (gHost.hc, 0x30);
   return true;
 }
 
@@ -290,45 +397,46 @@ static void hostLinkPrelink (void)
   gRootDiagnostic.preSet[1] = 0xffffffff;
   gRootDiagnostic.preSet[2] = 0xffffffff;
   gRootDiagnostic.preSet3 = 0xffffffff;
+  kprintf ("d110 a0 in\n");
   hostUicCommand (0x02, 0xD0A8u << 16, 0, 500000, &code, &value);   // VS_UNIPROPOWERDOWNCONTROL = 0
+  kprintf ("d110 a0 code=%x\n", code);
   gRootDiagnostic.preSet[0] = code;
+  kprintf ("d110 a1 in\n");
   hostUicCommand (0x02, 0x155Eu << 16, 0, 500000, &code, &value);   // PA_LOCAL_TX_LCC_ENABLE = 0
+  kprintf ("d110 a1 code=%x\n", code);
   gRootDiagnostic.preSet[1] = code;
+  kprintf ("d110 a2 in\n");
   IOReturn got = hostUicCommand (0x01, 0xD0A6u << 16, 0, 500000, &code, &value);   // VS_SAVEPOWERCONTROL
+  kprintf ("d110 a2 code=%x val=%x\n", code, value);
   gRootDiagnostic.preSet[2] = code;
   gRootDiagnostic.savePower = value;
   if (got == kIOReturnSuccess) {
+    kprintf ("d110 a3 in\n");
     hostUicCommand (0x02, 0xD0A6u << 16, value & ~0x40u, 500000, &code, &value);  // clear deep stall
+    kprintf ("d110 a3 code=%x\n", code);
     gRootDiagnostic.preSet3 = code;
   }
+  kprintf ("d110 a4 out\n");
 }
 
-// LK's power-off notify leaves a host power-mode change pending: the handoff shows
-// HCS.UPMCRS=PWR_LOCAL and a link startup in that state returns UIC failure 1 while a
-// DME_GET/SET still answers. Exit hibernate, power the UniPro stack on and enable it.
+// Last rung after endpoint reset: reset both UniPro PA endpoints and enable the local
+// endpoint (the broken-HCE flow in ufshcd_hba_enable), then let the caller retry.
 static void hostLinkWake (void)
 {
   uint32_t code = 0xffffffff, value = 0;
-  hostUicCommand (0x18, 0, 0, 2000000, &code, &value);   // DME_HIBERNATE_EXIT
-  gRootDiagnostic.wakeHib = code;
-  hostUicCommand (0x10, 0, 0, 2000000, &code, &value);   // DME_POWERON
-  gRootDiagnostic.wakePowerOn = code;
+  hostUicCommand (0x14, 0, 0, 2000000, &code, &value);   // DME_RESET
+  gRootDiagnostic.dmeReset = code;
   hostUicCommand (0x12, 0, 0, 2000000, &code, &value);   // DME_ENABLE
-  gRootDiagnostic.wakeEnable = code;
+  gRootDiagnostic.dmeEnable = code;
 }
 
-// Second rung after a failed startup round: reset the peer UniPro endpoint and repeat the wake ladder.
+// Second rung after a failed startup round: reset the peer UniPro endpoint (UFSHCI's
+// link recovery) and let the caller retry the vendor prelink + link startup.
 static void hostLinkRetry (void)
 {
   uint32_t code = 0xffffffff, value = 0;
   hostUicCommand (0x15, 0, 0, 2000000, &code, &value);   // DME_ENDPOINT_RESET
   gRootDiagnostic.retryReset = code;
-  hostUicCommand (0x18, 0, 0, 2000000, &code, &value);
-  gRootDiagnostic.retryHib = code;
-  hostUicCommand (0x10, 0, 0, 2000000, &code, &value);
-  gRootDiagnostic.retryPowerOn = code;
-  hostUicCommand (0x12, 0, 0, 2000000, &code, &value);
-  gRootDiagnostic.retryEnable = code;
 }
 
 static bool hostLinkStartup (const char **why)
@@ -336,8 +444,10 @@ static bool hostLinkStartup (const char **why)
   gRootDiagnostic.linkRound++;
   for (unsigned attempt = 1; attempt <= 3; ++attempt) {
     uint32_t code = 0xffffffff, value = 0;
+    kprintf ("d110 b%u in\n", attempt);
     hostUicCommand (0x16, 0, 0, 3000000, &code, &value);              // DME_LINKSTARTUP
     uint32_t hcs = read32 (gHost.hc, 0x30);
+    kprintf ("d110 b%u code=%x hcs=%x\n", attempt, code, hcs);
     gRootDiagnostic.linkResult = code;
     gRootDiagnostic.linkAttempts = attempt;
     gRootDiagnostic.linkHcs = hcs;
@@ -440,16 +550,34 @@ static IOReturn hostScsi (uint8_t lun, const uint8_t *cdb, unsigned cdbLength, b
 // START STOP UNIT, power condition ACTIVE (1h in the high nibble, as Linux ufshcd_set_dev_pwr_mode), to the UFS
 // Device well-known LU (0xD0). A device in UFS-PowerDown answers this command and ignores every other UPIU, so the
 // wake must precede the NOP OUT; on a clean handoff it is a no-op transition. IMMED stays 0: the command completes
-// only once the device is Active.
+// only once the device is Active. After a link reset the first command legitimately completes with CHECK CONDITION /
+// UNIT ATTENTION "power-on/reset occurred" (sense 6/29/00); the device clears the UA when it reports it, so retry a
+// few times. diag89 saw a later rejection (sense 5/25/00, LUN not supported) that repeating did not fix, so this is
+// not a gate: as long as the UTP itself completed (OCS == 0) the device is answering, and the NOP OUT / power query /
+// LUN 0 TUR decide whether it is up.
 static IOReturn hostWakeDevice (void)
 {
   static const uint8_t ssu[6] = { 0x1b, 0, 0, 0, 0x10, 0 };
+  IOReturn result = kIOReturnNotReady;
   uint32_t scsi = 0xffff;
-  IOReturn result = hostScsi (0xd0, ssu, 6, false, 0, 3000000, &scsi);
-  gRootDiagnostic.wakeResult = static_cast<uint32_t> (result);
-  gRootDiagnostic.wakeOcs = gRootDiagnostic.ocs;
-  gRootDiagnostic.wakeScsi = scsi;
-  return result;
+  for (unsigned attempt = 1; attempt <= 4; ++attempt) {
+    scsi = 0xffff;
+    result = hostScsi (0xd0, ssu, 6, false, 0, 3000000, &scsi);
+    gRootDiagnostic.wakeResult = static_cast<uint32_t> (result);
+    gRootDiagnostic.wakeOcs = gRootDiagnostic.ocs;
+    gRootDiagnostic.wakeScsi = scsi;
+    gRootDiagnostic.wakeAttempts = attempt;
+    gRootDiagnostic.wakeLastSense = gRootDiagnostic.sense;
+    if (attempt == 1) {
+      gRootDiagnostic.wakeFirstScsi = scsi;
+      gRootDiagnostic.wakeFirstSense = gRootDiagnostic.sense;
+    }
+    if (result == kIOReturnSuccess) break;
+    if (gRootDiagnostic.ocs != 0) break;
+    IOSleep (10);   // the UA clears on its first report; the extra attempts are cheap and harmless
+  }
+  if (gRootDiagnostic.ocs != 0) return result;
+  return kIOReturnSuccess;
 }
 
 // Query read request (opcode 0x03 READ ATTRIBUTE / 0x05 READ FLAG). Returns the value field.
@@ -481,7 +609,104 @@ static IOReturn hostQueryRead (uint8_t opcode, uint8_t idn, uint32_t *value)
   return kIOReturnSuccess;
 }
 
+// Query write request (opcode 0x06 SET FLAG). The request layout is hostQueryRead's with the query function switched to
+// standard write (0x81); index/selector/value stay zero, as Linux sends for fDeviceInit. The response echoes opcode/idn
+// and reports the query result code in byte 6.
+static IOReturn hostQuerySet (uint8_t opcode, uint8_t idn, uint8_t index)
+{
+  kprintf ("d112 qs in op=%x idn=%x\n", opcode, idn);
+  if (!hostClearUcd ()) return kIOReturnNotReady;
+  uint8_t *ucd = gHost.virt + kUcdOffset;
+  ucd[0] = 0x16;                      // QUERY REQUEST
+  ucd[3] = 1;
+  ucd[5] = 0x81;                      // standard write request
+  ucd[12] = opcode;
+  ucd[13] = idn;
+  ucd[14] = index;
+  uint32_t ocs = 0xf;
+  IOReturn status = hostSubmit (0, 0, 200000, &ocs);
+  kprintf ("d112 qs out st=%x ocs=%x\n", static_cast<uint32_t> (status), ocs);
+  if (status != kIOReturnSuccess) {
+    return status;
+  }
+  status = hostResponseHeader (0x36, 0, 1);
+  if (status != kIOReturnSuccess) return status;
+  const uint8_t *rsp = ucd + kRspOffset;
+  if (rsp[10] || rsp[11]) return hostProtocolError (4);
+  if (rsp[12] != opcode || rsp[13] != idn || rsp[14] != index || rsp[15]) return hostProtocolError (5);
+  if (rsp[6] != 0) {
+    gRootDiagnostic.result = static_cast<uint32_t> (kIOReturnError);
+    return kIOReturnError;
+  }
+  return kIOReturnSuccess;
+}
+
+// UFS device initialization, the step Linux runs as ufshcd_complete_dev_init before it touches any LU: SET FLAG
+// fDeviceInit (flag IDN 0x01, index 0), then poll READ FLAG until the device clears it (it clears the flag when its own
+// initialization completed, Linux allows 5 s at 500-1000 us). diag90 had the UPIU path fully working (SSU and TUR both
+// OCS=00) yet both ended CHECK CONDITION 5/25/00 while this step had never run. Recorded, not gated: the LUN 0 TUR after
+// it stays the single "device usable" decision, so one boot shows both outcomes.
+static IOReturn hostDeviceInit (void)
+{
+  kprintf ("d112 di0 m=%llx\n", mach_absolute_time ());
+  IOReturn status = kIOReturnError;
+  unsigned attempt = 0;
+  for (; attempt < 3; ++attempt) {
+    kprintf ("d112 di1 a=%u\n", attempt);
+    status = hostQuerySet (0x06, 0x01, 0);
+    kprintf ("d112 di2 a=%u st=%x\n", attempt, static_cast<uint32_t> (status));
+    if (status == kIOReturnSuccess || gHost.poisoned) break;
+    IOSleep (10);
+  }
+  gRootDiagnostic.devInitResult = static_cast<uint32_t> (status);
+  gRootDiagnostic.devInitAttempts = attempt + 1;
+  if (status != kIOReturnSuccess) return status;
+  uint32_t value = 1;
+  unsigned poll = 0;
+  status = kIOReturnTimeout;
+  for (; poll < 5000; ++poll) {
+    if (poll < 4 || (poll % 500) == 0) kprintf ("d112 dp n=%u t=%llx\n", poll, mach_absolute_time ());
+    IOReturn readStatus = hostQueryRead (0x05, 0x01, &value);
+    if (readStatus != kIOReturnSuccess) {
+      status = readStatus;
+      break;
+    }
+    if (!value) {
+      status = kIOReturnSuccess;
+      break;
+    }
+    IOSleep (1);
+  }
+  kprintf ("d112 dr st=%x n=%u v=%x\n", static_cast<uint32_t> (status), poll, value);
+  gRootDiagnostic.devInitPolls = poll;
+  gRootDiagnostic.devInitFlag = value;
+  return status;
+}
+
 // Read `blocks` (<= kDataMax / 4096) 4096-byte blocks of LUN `lun` starting at `lba` into dst.
+// diag93 data-path evidence: how many dwords of the 4 KiB destination still hold the 0xA5A5A5A5
+// prefill, and where (if anywhere) in the allocation the GPT header magic landed.
+static uint32_t hostDataPattern (uint32_t *firstDword)
+{
+  const volatile uint32_t *data =
+    reinterpret_cast<const volatile uint32_t *> (gHost.virt + kDataOffset + gProbeDataShift);
+  uint32_t pattern = 0;
+  for (unsigned index = 0; index < 1024; ++index) {
+    pattern += data[index] == 0xa5a5a5a5U;
+  }
+  if (firstDword) *firstDword = data[0];
+  return pattern;
+}
+
+static uint32_t hostFindGptMagic (void)
+{
+  const volatile uint32_t *whole = reinterpret_cast<const volatile uint32_t *> (gHost.virt);
+  for (unsigned index = 0; index + 1 < kDmaBytes / 4; ++index) {
+    if (whole[index] == 0x20494645U && whole[index + 1] == 0x54524150U) return index;
+  }
+  return 0xffffffffU;
+}
+
 static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *dst)
 {
   if (!gHost.ready || !dst || !blocks || blocks > kDataMax / 4096 || lba > 0xffffffffULL - (blocks - 1)) {
@@ -492,7 +717,46 @@ static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *ds
   uint8_t cdb[10] = { 0x28, 0, uint8_t (lba >> 24), uint8_t (lba >> 16), uint8_t (lba >> 8), uint8_t (lba),
                       0, uint8_t (blocks >> 8), uint8_t (blocks), 0 };
   uint32_t scsi = 0;
+  bool probe = gRootDiagnosticEnabled && lun == kUserdataLun && lba == 1 && blocks == 1;
+  if (probe) {
+    volatile uint32_t *data = reinterpret_cast<volatile uint32_t *> (gHost.virt + kDataOffset);
+    for (unsigned index = 0; index < 1024; ++index) data[index] = 0xa5a5a5a5U;
+  }
   IOReturn status = hostScsi (lun, cdb, 10, true, blocks * 4096U, 1000000, &scsi);
+  // diag94's LU2 LBA 0 read was the first command ever sent to the userdata LU and came back
+  // as a failure while the next read succeeded: a unit attention pending on that LU. SCSI
+  // leaves it armed until one command consumes it, so one re-issue of the same CDB is enough.
+  if (status != kIOReturnSuccess) {
+    if (probe) {
+      volatile uint32_t *data = reinterpret_cast<volatile uint32_t *> (gHost.virt + kDataOffset);
+      for (unsigned index = 0; index < 1024; ++index) data[index] = 0xa5a5a5a5U;
+    }
+    scsi = 0;
+    status = hostScsi (lun, cdb, 10, true, blocks * 4096U, 1000000, &scsi);
+  }
+  if (probe) {
+    gRootDiagnostic.dataPattern = hostDataPattern (&gRootDiagnostic.dataFirst);
+    gRootDiagnostic.dataAt = hostFindGptMagic ();
+    const volatile uint32_t *whole = reinterpret_cast<const volatile uint32_t *> (gHost.virt);
+    gRootDiagnostic.dataUtrd6 = whole[6];
+    gRootDiagnostic.dataUtrd7 = whole[7];
+    const volatile uint32_t *prd =
+      reinterpret_cast<const volatile uint32_t *> (gHost.virt + kUcdOffset + kPrdtOffset);
+    for (unsigned index = 0; index < 4; ++index) gRootDiagnostic.dataPrd[index] = prd[index];
+    gRootDiagnostic.dataIs = read32 (gHost.hc, 0x20);
+    // Retry once with the destination 64 KiB higher when the first transfer left its page untouched.
+    if (gRootDiagnostic.dataPattern == 1024 && gRootDiagnostic.dataAt == 0xffffffffU && !gHost.poisoned) {
+      volatile uint32_t *shifted = reinterpret_cast<volatile uint32_t *> (gHost.virt + kDataOffset + 65536);
+      for (unsigned index = 0; index < 1024; ++index) shifted[index] = 0xa5a5a5a5U;
+      gProbeDataShift = 65536;
+      uint32_t shiftedScsi = 0;
+      IOReturn shiftedStatus = hostScsi (lun, cdb, 10, true, blocks * 4096U, 1000000, &shiftedScsi);
+      gRootDiagnostic.dataShiftOk = static_cast<uint32_t> (shiftedStatus);
+      gRootDiagnostic.dataShiftPattern = hostDataPattern (&gRootDiagnostic.dataShiftFirst);
+      gRootDiagnostic.dataShiftAt = hostFindGptMagic ();
+      gProbeDataShift = 0;
+    }
+  }
   if (status == kIOReturnSuccess) {
     memcpy (dst, gHost.virt + kDataOffset, blocks * 4096U);
   }
@@ -533,10 +797,10 @@ static bool hostStoreOpen (uint64_t first, uint64_t blocks)
   return true;
 }
 
-// WRITE(10) of `blocks` 4096-byte blocks from src to lba on LUN 0; the range must lie inside one open window.
+// WRITE(10) of `blocks` 4096-byte blocks from src to lba on the userdata LUN; the range must lie inside one open window.
 static IOReturn hostWrite4k (uint8_t lun, uint64_t lba, uint32_t blocks, const void *src, bool fua = false)
 {
-  if (!gHost.ready || !src || !blocks || blocks > kDataMax / 4096 || lun != 0 || !hostInWindow (lba, blocks)) {
+  if (!gHost.ready || !src || !blocks || blocks > kDataMax / 4096 || lun != kUserdataLun || !hostInWindow (lba, blocks)) {
     return kIOReturnBadArgument;
   }
   IOLockLock (gHost.lock);
@@ -545,19 +809,19 @@ static IOReturn hostWrite4k (uint8_t lun, uint64_t lba, uint32_t blocks, const v
   uint8_t cdb[10] = { 0x2a, uint8_t (fua ? 0x08 : 0), uint8_t (lba >> 24), uint8_t (lba >> 16), uint8_t (lba >> 8), uint8_t (lba),
                       0, uint8_t (blocks >> 8), uint8_t (blocks), 0 };
   uint32_t scsi = 0;
-  IOReturn status = hostScsiDir (0, cdb, 10, 1, blocks * 4096U, 2000000, &scsi);
+  IOReturn status = hostScsiDir (lun, cdb, 10, 1, blocks * 4096U, 2000000, &scsi);
   IOLockUnlock (gHost.lock);
   return status;
 }
 
-// SYNCHRONIZE CACHE(10) for the whole LUN: everything written so far is on the medium when this returns.
+// SYNCHRONIZE CACHE(10) for the whole userdata LUN: everything written so far is on the medium when this returns.
 static IOReturn hostSyncCache (void)
 {
   if (!gHost.ready || (!gStoreOpen && !gLogOpen)) return kIOReturnNotReady;
   IOLockLock (gHost.lock);
   uint8_t cdb[10] = { 0x35 };
   uint32_t scsi = 0;
-  IOReturn status = hostScsiDir (0, cdb, 10, 0, 0, 10000000, &scsi);
+  IOReturn status = hostScsiDir (kUserdataLun, cdb, 10, 0, 0, 10000000, &scsi);
   IOLockUnlock (gHost.lock);
   return status;
 }

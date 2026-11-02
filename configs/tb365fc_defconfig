@@ -16,6 +16,22 @@ CONFIG_XNU_SHENG_PMGR=y
 # MT6835 UFS controller (ufshci@112b0000) as a read-only IOBlockStorageDevice;
 # root mode is enabled by the native-ufs-root=1 boot argument.
 CONFIG_XNU_NATIVE_UFS=y
+# Owner root chain (official a04br3 pattern): iPadOS mounts the root only when it is
+# owner-authenticated. The kernel carries the owner anchor, its self-test envelope and
+# the VerifiedRoot code; the OS/SystemOS VROOT01 envelopes live in a signed policy
+# region in userdata that ShengUfs verifies block by block (A04RPOL1). The audited
+# NativeVirtioBlock answers the root authorization query through ShengUfs's windows.
+CONFIG_XNU_NATIVE_VIRTIO_BLOCK=y
+CONFIG_XNU_VERIFIED_ROOT_PROBE=y
+CONFIG_XNU_OWNER_ROOT_AUDIT=y
+CONFIG_XNU_OWNER_ROOT_TRUST=y
+# Userland stage: mount the signed SystemOS cryptex before launchd starts so dyld
+# can open the shared cache; launchd then receives DYLD_SHARED_CACHE_DIR.
+CONFIG_XNU_OWNER_CACHE_MOUNT=y
+CONFIG_XNU_OWNER_CACHE_STARTUP=y
+CONFIG_XNU_OWNER_CACHE_VOLUME_UUID="8846FE78-2910-4297-AF97-D59BB6F8FC16"
+CONFIG_XNU_NATIVE_VIRTIO_BLOCK_ARCHIVE="{tree}/build/virtio-mmio-block-verified/libVirtioMmioBlock.a"
+CONFIG_XNU_VERIFIED_ROOT_ARCHIVE="{tree}/build/tb365fc-root-key/libTB365FCRootKey.a"
 
 # Display, input and GPU gates are added area by area once the hardware
 # inventory in porting.toml is complete.

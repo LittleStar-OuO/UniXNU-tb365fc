@@ -24,12 +24,17 @@
 #include "GccUfs.h"
 #include "RootDiagnostics.h"
 #include "TransferPoll.h"
+#include "verified_root.h"
 
 static UfsRootDiagnostics gRootDiagnostic;
 static bool gRootDiagnosticEnabled;
 static void rootDiagnosticFailure (const char *reason);
 
 extern "C" {
+#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+extern const struct vr_crypto vr_xnu_crypto;
+extern const uint8_t verified_root_key[];
+#endif
 volatile uint32_t native_ufs_probe_calls = 0;
 volatile uint32_t native_ufs_matched = 0;
 volatile uint32_t native_ufs_probe_requested = 0;
@@ -38,6 +43,10 @@ volatile uint32_t native_ufs_status = 0;
 // Root start: 1 entered, 2 host up, 3 layout found; the last soft-failure reason (a static string), for the boot page.
 volatile uint32_t native_ufs_root_step = 0;
 const char *volatile native_ufs_root_failure = nullptr;
+// diag116 ISR-beacon markers, defined by the ArmCpu driver.
+extern volatile uint32_t armcpu_marker_a, armcpu_marker_b, armcpu_marker_d;
+// diag117 framebuffer breadcrumbs, defined by bsd_init.c.
+void d117_mark (uint32_t slot);
 volatile uint32_t native_ufs_cap = 0;
 volatile uint32_t native_ufs_version = 0;
 volatile uint32_t native_ufs_hcs = 0;
@@ -45,6 +54,10 @@ volatile uint32_t native_ufs_hce = 0;
 volatile uint32_t native_ufs_utrl_ready = 0;
 volatile uint32_t native_ufs_uic_status = 0;
 volatile uint32_t native_ufs_uic_result = 0;
+volatile uint32_t native_ufs_policy_status = 0xffffffff;
+volatile uint32_t native_ufs_verified_windows = 0;
+volatile uint64_t native_ufs_verified_blocks = 0;
+volatile uint32_t native_ufs_integrity_failures = 0;
 }
 
 class NativeUfs : public IOService {
@@ -246,6 +259,7 @@ static bool hostBringUp (const char **why)
     // blocks and the PHY reference clock, or only parked the link.
     gRootDiagnostic.xoufs = read32 (gHost.hc, 0x140);
     gRootDiagnostic.refclk = read32 (gHost.hc, 0x144);
+    gRootDiagnostic.ipVer = read32 (gHost.hc, 0x2240);
     OSSharedPtr<IOMemoryMap> aoMap, pdnMap;
     uintptr_t ao = mapPhys (UFS_AO_BASE, 0x1000, aoMap);
     uintptr_t pdn = mapPhys (UFS_PDN_BASE, 0x1000, pdnMap);
@@ -255,20 +269,27 @@ static bool hostBringUp (const char **why)
     gRootDiagnostic.pdnReset = pdn ? read32 (pdn, 0x4c) : 0xffffffff;
   }
   gRootDiagnostic.stage = "DMA allocation";
+  kprintf ("d113 w0 m=%llx\n", mach_absolute_time ());
   gHost.dma = IOBufferMemoryDescriptor::inTaskWithOptions (
     kernel_task, static_cast<IOOptionBits> (kIODirectionInOut) | static_cast<IOOptionBits> (kIOMemoryPhysicallyContiguous) |
     static_cast<IOOptionBits> (kIOMemoryMapperNone),
     kDmaBytes, 4096);
   gHost.lock = IOLockAlloc ();
+  kprintf ("d113 w1 dma=%llx lock=%llx m=%llx\n", static_cast<unsigned long long> (reinterpret_cast<uintptr_t> (gHost.dma)),
+      static_cast<unsigned long long> (reinterpret_cast<uintptr_t> (gHost.lock)), mach_absolute_time ());
   if (!gHost.dma || !gHost.lock) {
     *why = "dma buffer";
     return false;
   }
   gHost.virt = static_cast<uint8_t *> (gHost.dma->getBytesNoCopy ());
+  kprintf ("d113 w2 virt=%llx m=%llx\n", static_cast<unsigned long long> (reinterpret_cast<uintptr_t> (gHost.virt)),
+      mach_absolute_time ());
   IOByteCount contiguous = 0;
   gHost.phys = gHost.dma->getPhysicalSegment (0, &contiguous, kIOMemoryMapperNone);
   gRootDiagnostic.dma = gHost.phys;
   gRootDiagnostic.contiguous = contiguous;
+  kprintf ("d113 w3 phys=%llx c=%llx m=%llx\n", gHost.phys, static_cast<unsigned long long> (contiguous),
+      mach_absolute_time ());
   if (!gHost.virt || !gHost.phys || (gHost.phys & 4095) || contiguous < kDmaBytes ||
       (!(read32 (gHost.hc, 0) & 0x01000000) && gHost.phys + kDmaBytes > 0x100000000ULL)) {
     *why = "DMA address/contiguity";
@@ -276,13 +297,16 @@ static bool hostBringUp (const char **why)
   }
   bzero (gHost.virt, kDmaBytes);
   cacheCivac (gHost.virt, kDmaBytes);
+  kprintf ("d113 w4 m=%llx\n", mach_absolute_time ());
   // A healthy handoff has both UTP lists and the UIC channel ready and no fatal
   // power-mode change pending: take the request list over as before. Anything
   // else (the MTK bootloader parks the UniPro link) is reset and brought up the
   // way the MTK UEFI driver does, including its pre-link DME writes.
   uint32_t status = read32 (gHost.hc, 0x30);
+  kprintf ("d113 w5 hcs=%x m=%llx\n", status, mach_absolute_time ());
   bool healthy = (read32 (gHost.hc, 0x34) & 1) && (status & 0x0f) == 0x0f &&
                  ((status >> 8) & 7) == 0 && !(read32 (gHost.hc, 0x20) & kUfsFatalStatus);
+  kprintf ("d113 w6 healthy=%u m=%llx\n", healthy ? 1U : 0U, mach_absolute_time ());
   if (healthy) {
     gRootDiagnostic.stage = "request list";
     if (!hostStopQueue (why)) return false;
@@ -290,49 +314,72 @@ static bool hostBringUp (const char **why)
   } else {
     // LK's power-off notify cut the device rails and stopped inside a host power-mode change
     // (HCS.UPMCRS=PWR_LOCAL), which makes every link-level UIC command fail. Power the MTK
-    // stack up, then reset the host controller: the reset clears UPMCRS and the stale request
-    // list, and only then does the wake ladder stand a chance. The queue starts after the
-    // link, since DP drops to 0 across the reset.
+    // stack up, then run the mainline MTK host reset: assert and release hci/crypto/unipro,
+    // set XOUFS with HCE still 0, and only then enable HCE. The queue starts after the link,
+    // since DP drops to 0 across the reset.
     gRootDiagnostic.stage = "mtk power up";
     hostMtkPowerUp ();
-    gRootDiagnostic.stage = "host controller reset";
-    if (!hostResetController (why)) return false;
-    gRootDiagnostic.stage = "link wake";
-    hostLinkWake ();
-    gRootDiagnostic.stage = "link prelink";
-    hostLinkPrelink ();
-    gRootDiagnostic.stage = "link startup";
-    bool linked = hostLinkStartup (why);
-    if (!linked) {
-      gRootDiagnostic.stage = "link retry";
-      hostLinkRetry ();
+    bool linked = false;
+    for (unsigned round = 0; round < 2 && !linked; ++round) {
+      gRootDiagnostic.stage = round ? "host reset retry" : "host controller reset";
+      if (!hostResetController (why)) return false;
+      kprintf ("d110 L0 m=%llx\n", mach_absolute_time ());
+      gRootDiagnostic.stage = "link prelink";
       hostLinkPrelink ();
       gRootDiagnostic.stage = "link startup";
       linked = hostLinkStartup (why);
+      if (!linked) {
+        gRootDiagnostic.stage = "link retry";
+        hostLinkRetry ();
+        hostLinkWake ();
+        hostLinkPrelink ();
+        gRootDiagnostic.stage = "link startup";
+        linked = hostLinkStartup (why);
+      }
     }
     for (unsigned i = 0; i < 5; ++i) gRootDiagnostic.uic[i] = read32 (gHost.hc, 0x38 + 4 * i);
     gRootDiagnostic.linkOk = linked ? 1 : 0;
+    if (!linked) {
+      gRootDiagnostic.stage = "link startup";
+      *why = "link startup";
+      return false;
+    }
     gRootDiagnostic.stage = "request list";
+    kprintf ("d111 stq in\n");
+    // UTRLBA is only writable while the request list is stopped; the old
+    // firmware list must be stopped before the takeover re-programs it.
+    if (!hostStopQueue (why)) return false;
+    kprintf ("d111 stq out\n");
     if (!hostStartQueue (why)) return false;
+    kprintf ("d111 str out\n");
   }
   // The handoff leaves the device in UFS-PowerDown, where every UPIU but SSU is dropped
   // (diag84's NOP OUT got OCS 5 PEER_COMM_FAILURE). Wake it to Active before the NOP proof.
   gRootDiagnostic.stage = "device wake";
-  if (hostWakeDevice () != kIOReturnSuccess) {
+  kprintf ("d111 w in\n");
+  IOReturn woke = hostWakeDevice ();
+  kprintf ("d111 w out r=%x ocs=%x scsi=%x\n", woke, gRootDiagnostic.ocs, gRootDiagnostic.wakeScsi);
+  if (woke != kIOReturnSuccess) {
     gHost.ready = false;
     *why = "device wake (START STOP UNIT)";
     return false;
   }
   gRootDiagnostic.stage = "NOP OUT";
   // NOP OUT proves the UPIU path before touching the SCSI layer.
-  if (hostNop () != kIOReturnSuccess) {
+  kprintf ("d111 n in\n");
+  IOReturn nop = hostNop ();
+  kprintf ("d111 n out r=%x\n", nop);
+  if (nop != kIOReturnSuccess) {
     gHost.ready = false;
     *why = "NOP OUT";
     return false;
   }
   uint32_t power = 0;
   gRootDiagnostic.stage = "power mode query";
-  if (hostQueryRead (0x03, 0x02, &power) != kIOReturnSuccess) {
+  kprintf ("d111 p in\n");
+  IOReturn qr = hostQueryRead (0x03, 0x02, &power);
+  kprintf ("d111 p out r=%x v=%x\n", qr, power);
+  if (qr != kIOReturnSuccess) {
     gHost.ready = false;
     *why = "power mode query";
     return false;
@@ -348,21 +395,47 @@ static bool hostBringUp (const char **why)
     }
     IOSleep (50);
   }
+  // UFS device initialization (Linux ufshcd_complete_dev_init) belongs between the NOP proof and the first LU command.
+  // diag90 proved the UPIU path end to end with the device Active, yet both the SSU and the LUN 0 TUR ended CHECK
+  // CONDITION 5/25/00 - the signature of LU access before the device initialized. Not gated; INIT line records it.
+  gRootDiagnostic.stage = "device init";
+  IOReturn initStatus = hostDeviceInit ();
+  kprintf ("d112 di out st=%x n=%u v=%x\n", static_cast<uint32_t> (initStatus),
+      gRootDiagnostic.devInitPolls, gRootDiagnostic.devInitFlag);
   gRootDiagnostic.stage = "LUN ready";
-  for (unsigned attempt = 0; attempt < 20; attempt++) {
+  // diag89 left the SSU at CHECK CONDITION (UA then 5/25/00), so the LUN 0 TEST UNIT READY below is the real
+  // "device usable" proof. A freshly powered mode change can answer UA / not-ready for a while; retry long enough.
+  kprintf ("d112 lr in poisoned=%u\n", gHost.poisoned ? 1U : 0U);
+  for (unsigned attempt = 0; attempt < 40; attempt++) {
     uint8_t tur[6] = { 0, 0, 0, 0, 0, 0 };
     uint32_t scsi = 0;
-    if (hostScsi (0, tur, 6, false, 0, 200000, &scsi) == kIOReturnSuccess) {
+    IOReturn turStatus = hostScsi (0, tur, 6, false, 0, 200000, &scsi);
+    if (attempt < 3 || turStatus == kIOReturnSuccess || gHost.poisoned) {
+      kprintf ("d112 tur a=%u st=%x ocs=%x scsi=%x t=%llx\n", attempt,
+          static_cast<uint32_t> (turStatus), gRootDiagnostic.ocs, scsi, mach_absolute_time ());
+    }
+    if (turStatus == kIOReturnSuccess) {
       gHost.ready = true;
       return true;
     }
     if (gHost.poisoned) break;
-    IOSleep (10);
+    IOSleep (20);
   }
   gHost.ready = false;
   *why = "LUN 0 not ready";
   return false;
 }
+}
+
+// diag108: let a kernel thread outside this file read where the bring-up stopped.
+extern "C" const char *native_ufs_d108_stage (void)
+{
+  return gRootDiagnostic.stage;
+}
+
+extern "C" uint32_t native_ufs_d108_flags (void)
+{
+  return (gHost.ready ? 1U : 0U) | (gHost.poisoned ? 2U : 0U);
 }
 
 namespace {
@@ -372,8 +445,129 @@ static uint32_t be32w (const uint8_t *at)
 }
 
 #include "RootLayout.h"
+#include "RootPolicy.h"
 #include "RootWindowRead.h"
 #include "RootPublication.h"
+
+#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+// The region as read from userdata, then made read-only, followed by a read-only copy of the owner key on its own
+// page. vr_open requires both to stay immutable for as long as the views opened on them are used: the windows never
+// free it.
+struct RootPolicyStore {
+  vm_offset_t storage = 0;
+  vm_size_t storageBytes = 0;
+  const uint8_t *key = nullptr;
+  RootPolicyHeader header;
+};
+RootPolicyStore gRootPolicy;
+
+static void policyDigest (const uint8_t *header, uint8_t digest[32])
+{
+  static const uint8_t zero[32] = {};
+  SHA256_CTX context;
+  SHA256_Init (&context);
+  SHA256_Update (&context, header, kRootPolicyHashed);
+  SHA256_Update (&context, zero, sizeof (zero));
+  SHA256_Final (digest, &context);
+}
+
+static const char *policyReason (unsigned status)
+{
+  switch (status) {
+  case kRootPolicyNoMagic: return "no A04RPOL1 policy region after the root windows";
+  case kRootPolicyVersion: return "policy version or entry count";
+  case kRootPolicyHash: return "policy header SHA-256 mismatch";
+  case kRootPolicySize: return "policy region size";
+  case kRootPolicyEntryBounds: return "policy entry bounds";
+  case kRootPolicyEntryOverlap: return "policy entries overlap";
+  default: return "policy region rejected";
+  }
+}
+
+static void freeRootPolicy (void)
+{
+  if (gRootPolicy.storage) kmem_free (kernel_map, gRootPolicy.storage, gRootPolicy.storageBytes);
+  gRootPolicy = {};
+}
+
+// Reads the whole region into kernel memory, checks its header again from that copy and makes it read-only.
+// Returns nullptr or the reason the region is unusable.
+static const char *loadRootPolicy (const RootLayout *layout)
+{
+  uint64_t partitionBytes = (layout->userdataLast - layout->userdataFirst + 1) * 4096ULL;
+  uint64_t start = rootPolicyRegionOffset (layout);
+  if (start >= partitionBytes || partitionBytes - start < kRootPolicyHeaderBytes) return "policy region outside userdata";
+  uint64_t available = partitionBytes - start;
+  uint64_t firstLba = layout->userdataFirst + start / 4096;
+  RootPolicyHeader header;
+  unsigned status;
+  uint8_t digest[32];
+  gRootDiagnostic.stage = "policy header";
+  if (hostRead4k (kUserdataLun, firstLba, 1, gScratch) != kIOReturnSuccess) return "policy header read failed";
+  policyDigest (gScratch, digest);
+  status = parseRootPolicyHeader (gScratch, digest, available, header);
+  native_ufs_policy_status = status;
+  kprintf ("d114 pol hdr st=%u bytes=%llx t=%llx\n", status,
+      status == kRootPolicyOk ? header.totalBytes : 0ULL, mach_absolute_time ());
+  if (status != kRootPolicyOk) return policyReason (status);
+  vm_size_t tableBytes = round_page (static_cast<vm_size_t> (header.totalBytes));
+  vm_size_t keyBytes = round_page (static_cast<vm_size_t> (VR_KEY_BYTES));
+  if (tableBytes < header.totalBytes || uint64_t (tableBytes) > UINT64_MAX - keyBytes) return "policy size overflow";
+  vm_offset_t storage = 0;
+  gRootDiagnostic.stage = "policy allocation";
+  armcpu_marker_a = 1;
+  d117_mark (0);
+  kprintf ("d114 pol mem in n=%llx t=%llx\n", static_cast<uint64_t> (tableBytes + keyBytes),
+      mach_absolute_time ());
+  d117_mark (1);
+  armcpu_marker_d = 1;
+  d117_mark (2);
+  kern_return_t allocResult = kmem_alloc (kernel_map, &storage, tableBytes + keyBytes,
+                  static_cast<kma_flags_t> (KMA_KOBJECT | KMA_DATA), VM_KERN_MEMORY_SECURITY);
+  d117_mark (3);
+  armcpu_marker_b = 1;
+  kprintf ("d115 alloc ret kr=%d a=%llx t=%llx\n", allocResult, static_cast<uint64_t> (storage),
+      mach_absolute_time ());
+  if (allocResult != KERN_SUCCESS)
+    return "policy allocation";
+  gRootPolicy.storage = storage;
+  gRootPolicy.storageBytes = tableBytes + keyBytes;
+  uint8_t *region = reinterpret_cast<uint8_t *> (storage);
+  IOLog ("NativeUfs: reading the signed root policy, %llu bytes at userdata +%llu\n", header.totalBytes, start);
+  kprintf ("d115 iolog ok t=%llx\n", mach_absolute_time ());
+  kprintf ("d114 pol mem ok t=%llx\n", mach_absolute_time ());
+  gRootDiagnostic.stage = "policy region read";
+  uint64_t blocks = header.totalBytes / 4096, chunk = kDataMax / 4096;
+  kprintf ("d114 pol rd in blocks=%llu ch=%llu t=%llx\n", blocks, chunk, mach_absolute_time ());
+  for (uint64_t done = 0; done < blocks; done += chunk) {
+    uint32_t count = blocks - done > chunk ? static_cast<uint32_t> (chunk) : static_cast<uint32_t> (blocks - done);
+    if (hostRead4k (kUserdataLun, firstLba + done, count, region + done * 4096) != kIOReturnSuccess) {
+      freeRootPolicy ();
+      return "policy region read failed";
+    }
+  }
+  kprintf ("d114 pol rd ok t=%llx\n", mach_absolute_time ());
+  // The header is taken from the copy that the envelopes are opened from, and must describe the same region.
+  policyDigest (region, digest);
+  status = parseRootPolicyHeader (region, digest, available, gRootPolicy.header);
+  native_ufs_policy_status = status;
+  if (status != kRootPolicyOk || gRootPolicy.header.totalBytes != header.totalBytes) {
+    freeRootPolicy ();
+    return status != kRootPolicyOk ? policyReason (status) : "policy region changed while it was read";
+  }
+  uint8_t *key = region + tableBytes;
+  memcpy (key, verified_root_key, VR_KEY_BYTES);
+  gRootDiagnostic.stage = "policy read-only protection";
+  if (vm_map_protect (kernel_map, storage, storage + tableBytes + keyBytes, VM_PROT_READ, TRUE) != KERN_SUCCESS) {
+    freeRootPolicy ();
+    return "policy read-only protection";
+  }
+  gRootPolicy.key = key;
+  gRootDiagnostic.policyCount = gRootPolicy.header.count;
+  IOLog ("NativeUfs: signed root policy read, %u entries\n", gRootPolicy.header.count);
+  return nullptr;
+}
+#endif
 
 }
 
@@ -461,7 +655,7 @@ extern "C" int native_ufs_store_read (uint64_t rel, uint32_t blocks, void *dst)
   if (!gStoreRegionBlocks || !dst || !blocks || rel >= gStoreRegionBlocks || blocks > gStoreRegionBlocks - rel) return 0;
   while (blocks) {
     uint32_t chunk = blocks > kDataMax / 4096 ? static_cast<uint32_t> (kDataMax / 4096) : blocks;
-    if (hostRead4k (0, gStoreRegionFirst + rel, chunk, dst) != kIOReturnSuccess) return 0;
+    if (hostRead4k (kUserdataLun, gStoreRegionFirst + rel, chunk, dst) != kIOReturnSuccess) return 0;
     dst = static_cast<uint8_t *> (dst) + chunk * 4096ULL;
     rel += chunk;
     blocks -= chunk;
@@ -476,7 +670,7 @@ extern "C" int native_ufs_store_write (uint64_t rel, uint32_t blocks, const void
   while (blocks) {
     uint32_t chunk = blocks > kDataMax / 4096 ? static_cast<uint32_t> (kDataMax / 4096) : blocks;
     // Forced unit access: the block is on the medium when the command completes, so the overlay needs no cache flush.
-    if (hostWrite4k (0, gStoreRegionFirst + rel, chunk, src, true) != kIOReturnSuccess) return 0;
+    if (hostWrite4k (kUserdataLun, gStoreRegionFirst + rel, chunk, src, true) != kIOReturnSuccess) return 0;
     src = static_cast<const uint8_t *> (src) + chunk * 4096ULL;
     rel += chunk;
     blocks -= chunk;
@@ -538,7 +732,7 @@ extern "C" int native_ufs_log_write (uint64_t rel, uint32_t blocks, const void *
   if (!gLogRegionBlocks || !src || !blocks || rel >= gLogRegionBlocks || blocks > gLogRegionBlocks - rel) return 0;
   while (blocks) {
     uint32_t chunk = blocks > kDataMax / 4096 ? static_cast<uint32_t> (kDataMax / 4096) : blocks;
-    if (hostWrite4k (0, gLogRegionFirst + rel, chunk, src) != kIOReturnSuccess) return 0;
+    if (hostWrite4k (kUserdataLun, gLogRegionFirst + rel, chunk, src) != kIOReturnSuccess) return 0;
     src = static_cast<const uint8_t *> (src) + chunk * 4096ULL;
     rel += chunk;
     blocks -= chunk;
@@ -555,7 +749,7 @@ extern "C" int native_ufs_export_write (uint64_t rel, uint32_t blocks, const voi
   const uint64_t base = gLogRegionFirst - kExportBlocks;
   while (blocks) {
     uint32_t chunk = blocks > kDataMax / 4096 ? static_cast<uint32_t> (kDataMax / 4096) : blocks;
-    if (hostWrite4k (0, base + rel, chunk, src) != kIOReturnSuccess) return 0;
+    if (hostWrite4k (kUserdataLun, base + rel, chunk, src) != kIOReturnSuccess) return 0;
     src = static_cast<const uint8_t *> (src) + chunk * 4096ULL;
     rel += chunk;
     blocks -= chunk;
@@ -573,13 +767,13 @@ extern "C" unsigned native_ufs_store_gpt_check (void)
 {
   if (!gStoreGeometry.valid || !gHost.ready) return 1;
   static uint8_t block[4096];
-  if (hostRead4k (0, 1, 1, block) != kIOReturnSuccess) return 2;
+  if (hostRead4k (kUserdataLun, 1, 1, block) != kIOReturnSuccess) return 2;
   uint32_t headerBytes = le32 (block + 12);
   if (headerBytes < 92 || headerBytes > 4096 || rootCrc32 (block, headerBytes, true) != le32 (block + 16) ||
       le32 (block + 16) != gStoreGeometry.headerCrc) return 3;
   uint32_t blocks = (gStoreGeometry.entryCount * 128 + 4095) / 4096;
   static uint8_t entries[4096 * 4];
-  if (blocks > 4 || hostRead4k (0, gStoreGeometry.entriesLba, blocks, entries) != kIOReturnSuccess) return 4;
+  if (blocks > 4 || hostRead4k (kUserdataLun, gStoreGeometry.entriesLba, blocks, entries) != kIOReturnSuccess) return 4;
   return rootCrc32 (entries, gStoreGeometry.entryCount * 128) == gStoreGeometry.entriesCrc ? 0 : 5;
 }
 
@@ -588,15 +782,25 @@ extern "C" unsigned native_ufs_store_gpt_check (void)
 // the virtio path.
 class NativeUfsBlock : public IOBlockStorageDevice {
   OSDeclareDefaultStructors (NativeUfsBlock)
-  uint64_t absolute = 0;      // byte offset of the window on LUN 0
+  uint64_t absolute = 0;      // byte offset of the window on the userdata LUN
   uint64_t bytes = 0;
   char label[32] = {};
   uint8_t *bounce = nullptr;
   IOLock *windowLock = nullptr;
   bool online = false;
+#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+  bool verifiedActive = false;
+  struct vr_view verified = {};
+  const uint8_t *envelope = nullptr;    // the selected VROOT01 envelope in the read-only policy copy
+#endif
 public:
   const char *windowLabel () const { return label; }
   bool configure (const char *name, uint64_t absoluteOffset, uint64_t size);
+#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+  bool configureVerification ();
+  IOReturn verifyWindowBlock (uint64_t index, const void *data, size_t length);
+  bool authenticatesVolume (const char *uuid, uint8_t *manifestDigest) const;
+#endif
   bool start (IOService *provider) override;
   void free () override;
   IOReturn doEjectMedia () override { return kIOReturnUnsupported; }
@@ -605,7 +809,7 @@ public:
   char *getVendorString () override { return const_cast<char *> ("Native"); }
   char *getProductString () override { return label; }
   char *getRevisionString () override { return const_cast<char *> ("1.0"); }
-  char *getAdditionalDeviceInfoString () override { return const_cast<char *> ("UFS LUN 0 userdata window, read-only"); }
+  char *getAdditionalDeviceInfoString () override { return const_cast<char *> ("UFS userdata-LUN window, read-only"); }
   IOReturn reportBlockSize (UInt64 *value) override { *value = 512; return kIOReturnSuccess; }
   IOReturn reportEjectability (bool *value) override { *value = false; return kIOReturnSuccess; }
   IOReturn reportMaxValidBlock (UInt64 *value) override { *value = bytes / 512 - 1; return kIOReturnSuccess; }
@@ -653,6 +857,10 @@ static void rootDiagnosticFailure (const char *reason)
   gRootDiagnostic.failures = native_ufs_block_failures;
   formatUfsRootDiagnostics (gRootDiagnosticText, sizeof (gRootDiagnosticText), gRootDiagnostic, reason);
   strlcat (gRootDiagnosticText, gRootMediaText, sizeof (gRootDiagnosticText));
+  // The console keeps only the newest rows; the beginning of this text (which names the reason) can scroll off.
+  // Repeat the reason at the very end so the panic page always shows it.
+  strlcat (gRootDiagnosticText, "\nWHY ", sizeof (gRootDiagnosticText));
+  if (reason) strlcat (gRootDiagnosticText, reason, sizeof (gRootDiagnosticText));
   panic ("%s", gRootDiagnosticText);
 }
 
@@ -670,8 +878,93 @@ bool NativeUfsBlock::configure (const char *name, uint64_t absoluteOffset, uint6
   if (!bounce) {
     return false;
   }
+#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+  // Reads are served only after each 4096-byte integrity block verifies against the owner-signed
+  // policy; without a matching policy the device is never published.
+  return configureVerification ();
+#else
+  return true;
+#endif
+}
+
+#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+// Selects this window's policy and opens it (vr_open, owner key, minimum generation 1). A window without
+// exactly one capacity-matching, owner-signed envelope is never served.
+bool NativeUfsBlock::configureVerification ()
+{
+  gRootDiagnostic.stage = "policy selection";
+  gRootDiagnostic.windowBytes = bytes;
+  gRootDiagnostic.policyCount = gRootPolicy.header.count;
+  gRootDiagnostic.verify = 0xffffffff;
+  if (!gRootPolicy.storage || !gRootPolicy.key) {
+    gRootDiagnostic.stage = "no signed root policy";
+    return false;
+  }
+  const uint8_t *region = reinterpret_cast<const uint8_t *> (gRootPolicy.storage);
+  unsigned index = 0;
+  switch (selectRootPolicy (region, gRootPolicy.header, bytes, index)) {
+  case kRootPolicySelected: break;
+  case kRootPolicyDuplicate: gRootDiagnostic.stage = "two policies match the window"; return false;
+  default: gRootDiagnostic.stage = "no policy matches the window"; return false;
+  }
+  const RootPolicyEntry &entry = gRootPolicy.header.entry[index];
+  struct vr_view view = {};
+  int status = vr_open (region + entry.offset, static_cast<size_t> (entry.bytes), gRootPolicy.key, 1,
+                        &vr_xnu_crypto, &view);
+  gRootDiagnostic.verify = static_cast<uint32_t> (status);
+  if (status != VR_OK) return false;
+  if (view.image_bytes != bytes) {
+    gRootDiagnostic.stage = "signed image size differs from the window";
+    return false;
+  }
+  verified = view;
+  envelope = region + entry.offset;
+  verifiedActive = true;
+  native_ufs_verified_windows = native_ufs_verified_windows + 1;
   return true;
 }
+
+IOReturn NativeUfsBlock::verifyWindowBlock (uint64_t index, const void *data, size_t length)
+{
+  if (!verifiedActive) return kIOReturnNotReady;
+  if (vr_verify_block (&verified, index, data, length, &vr_xnu_crypto) != VR_OK) {
+    __atomic_fetch_add (&native_ufs_integrity_failures, 1, __ATOMIC_RELAXED);
+    return kIOReturnIOError;
+  }
+  __atomic_fetch_add (&native_ufs_verified_blocks, 1, __ATOMIC_RELAXED);
+  return kIOReturnSuccess;
+}
+
+bool NativeUfsBlock::authenticatesVolume (const char *uuid, uint8_t *manifestDigest) const
+{
+  if (!uuid || !online || !verifiedActive || !verified.hashes) {
+    return false;
+  }
+  static const char hex[] = "0123456789ABCDEF";
+  char expected[37];
+  unsigned at = 0;
+  for (unsigned i = 0; i < 16; ++i) {
+    if (i == 4 || i == 6 || i == 8 || i == 10) {
+      expected[at++] = '-';
+    }
+    expected[at++] = hex[verified.volume_uuid[i] >> 4];
+    expected[at++] = hex[verified.volume_uuid[i] & 15];
+  }
+  expected[at] = 0;
+  if (strcmp (uuid, expected)) {
+    return false;
+  }
+  if (manifestDigest) {
+    // Hash only the authenticated envelope, excluding allocation padding and key.
+    const uint64_t envelopeBytes = VR_HEADER_BYTES + VR_SIGNATURE_BYTES + verified.block_count * 32;
+    SHA384_CTX context;
+    SHA384_Init (&context);
+    SHA384_Update (&context, envelope, static_cast<size_t> (envelopeBytes));
+    SHA384_Final (manifestDigest, &context);
+  }
+  return true;
+}
+#endif
 
 bool NativeUfsBlock::start (IOService *provider)
 {
@@ -699,19 +992,24 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
   struct Operations {
     IOLock *mutex;
     IOMemoryDescriptor *buffer;
+    NativeUfsBlock *owner;
     void lock () { IOLockLock (mutex); }
     void unlock () { IOLockUnlock (mutex); }
-    IOReturn read (uint64_t lba, uint32_t blocks, void *out) { return hostRead4k (0, lba, blocks, out); }
+    IOReturn read (uint64_t lba, uint32_t blocks, void *out) { return hostRead4k (kUserdataLun, lba, blocks, out); }
     IOReturn verify (uint64_t index, const void *data, size_t length) {
+#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+      return owner->verifyWindowBlock (index, data, length);
+#else
       (void) index; (void) data; (void) length;
       return kIOReturnSuccess;
+#endif
     }
     uint64_t copy (uint64_t offset, const void *data, uint64_t length) {
       uint64_t copied = buffer->writeBytes (offset, data, length);
       if (copied == length) __atomic_fetch_add (&native_ufs_block_reads, 1, __ATOMIC_RELAXED);
       return copied;
     }
-  } operations = { windowLock, buffer };
+  } operations = { windowLock, buffer, this };
   UfsWindowResult outcome = ufsReadWindow (operations, absolute, bytes, block, count, bounce);
   IOReturn result = outcome.status;
   uint64_t done = outcome.done;
@@ -736,6 +1034,19 @@ void NativeUfsBlock::free ()
   }
   IOBlockStorageDevice::free ();
 }
+
+#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+// Called from the root authorization query in NativeVirtioBlock: -1 when `provider` is not a
+// UFS window, otherwise 1 if its signed volume UUID equals `uuid`, else 0.
+extern "C" int native_ufs_block_authenticates (IOService *provider, const char *uuid, uint8_t *digest)
+{
+  NativeUfsBlock *block = OSDynamicCast (NativeUfsBlock, provider);
+  if (!block) {
+    return -1;
+  }
+  return block->authenticatesVolume (uuid, digest) ? 1 : 0;
+}
+#endif
 
 // Ordered publication of the root windows. The original owner-trust code resolves the SystemOS
 // volume by UUID immediately after the root is mounted, so SystemOS must already have published its
@@ -801,6 +1112,7 @@ static void discardPendingWindow (unsigned index)
 
 static void publishThread (void *, wait_result_t)
 {
+  kprintf ("d114 pub in t=%llx\n", mach_absolute_time ());
   struct Operations {
     bool start (unsigned index) {
       NativeUfsBlock *device = gPendingDevice[index];
@@ -810,6 +1122,7 @@ static void publishThread (void *, wait_result_t)
       if (!device->start (gPendingProvider)) return false;
       native_ufs_blocks_published = native_ufs_blocks_published + 1;
       IOLog ("NativeUfs: published %s\n", device->windowLabel ());
+      kprintf ("d114 pub st %s t=%llx\n", device->windowLabel (), mach_absolute_time ());
       return true;
     }
     bool wait (unsigned index) {
@@ -825,6 +1138,8 @@ static void publishThread (void *, wait_result_t)
         IOSleep (100);
       }
       IOLog ("NativeUfs: %s media %s\n", device->windowLabel (), ready ? "ready" : "not ready");
+      kprintf ("d114 media %s r=%u t=%llx\n", device->windowLabel (), ready ? 1U : 0U,
+          mach_absolute_time ());
       if (!ready) captureMissingMedia (device->windowLabel ());
       return ready;
     }
@@ -935,7 +1250,7 @@ bool NativeUfs::start (IOService *provider)
   PE_parse_boot_argn ("native-ufs-diagnostics", &diagnostic, sizeof (diagnostic));
   gRootDiagnosticEnabled = diagnostic == 1;
   if (probe == 10) {
-    // Read-only check before anything is flashed: LUN 0 GPT -> "userdata" -> its first block.
+    // Read-only check before anything is flashed: userdata-LUN GPT -> "userdata" -> its first block.
     const char *why = "";
     if (!hostBringUp (&why)) {
       panic ("NATIVE_UFS root check: bring-up failed: %s", why);
@@ -966,7 +1281,7 @@ bool NativeUfs::start (IOService *provider)
     uint32_t seen[4] = {};
     for (uint32_t index = 0; index < layout->windows && index < 4; index++) {
       uint64_t absolute = layout->userdataFirst * 4096ULL + layout->window[index].offset;
-      if (hostRead4k (0, absolute / 4096, 1, gScratch) == kIOReturnSuccess) {
+      if (hostRead4k (kUserdataLun, absolute / 4096, 1, gScratch) == kIOReturnSuccess) {
         seen[index] = 1;
         sig[index][0] = le32 (gScratch + 512);
         sig[index][1] = le32 (gScratch + 516);
@@ -1034,6 +1349,7 @@ bool NativeUfs::startRoot (IOService *provider)
     IOLog ("NativeUfs: root bring-up failed: %s\n", why);
     return false;
   }
+  kprintf ("d114 bring ok t=%llx\n", mach_absolute_time ());
   native_ufs_root_step = 2;
   RootLayout *layout = static_cast<RootLayout *> (IOMalloc (sizeof (RootLayout)));
   if (!layout || !findRootLayout (layout, &why)) {
@@ -1042,6 +1358,9 @@ bool NativeUfs::startRoot (IOService *provider)
     if (layout) IOFree (layout, sizeof (RootLayout));
     return false;
   }
+  kprintf ("d114 layout w=%u first=%llx last=%llx img=%llx ms=%u t=%llx\n",
+      layout->windows, layout->userdataFirst, layout->userdataLast, layout->imageBytes,
+      layout->manifestStatus, mach_absolute_time ());
   native_ufs_root_step = 3;
   if (layout->manifestStatus != 0) {
     rootDiagnosticFailure ("root manifest rejected");
@@ -1050,6 +1369,20 @@ bool NativeUfs::startRoot (IOService *provider)
     IOFree (layout, sizeof (RootLayout));
     return false;
   }
+#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+  // The owner-signed policy region lives after the flashed root image; it is loaded and verified
+  // before any window exists, because each window's vr_view opens on it.
+  native_ufs_root_step = 4;
+  kprintf ("d114 policy in t=%llx\n", mach_absolute_time ());
+  if (const char *policyWhy = loadRootPolicy (layout)) {
+    rootDiagnosticFailure (policyWhy);
+    IOLog ("NativeUfs: signed root policy: %s\n", policyWhy);
+    IOFree (layout, sizeof (RootLayout));
+    return false;
+  }
+  kprintf ("d114 policy ok bytes=%llx t=%llx\n",
+      static_cast<uint64_t> (gRootPolicy.header.totalBytes), mach_absolute_time ());
+#endif
   gStoreGeometry = { true, layout->userdataFirst, layout->userdataLast, layout->imageBytes, layout->gptEntriesLba,
                      layout->gptHeaderCrc, layout->gptEntriesCrc, layout->gptEntryCount };
   const char *names[4] = {};
@@ -1059,11 +1392,13 @@ bool NativeUfs::startRoot (IOService *provider)
     IOFree (layout, sizeof (RootLayout));
     return false;
   }
+  kprintf ("d114 plan w=%u t=%llx\n", layout->windows, mach_absolute_time ());
   if (!IOService::start (provider)) {
     rootDiagnosticFailure ("root IOService start failed");
     IOFree (layout, sizeof (RootLayout));
     return false;
   }
+  kprintf ("d114 svc ok t=%llx\n", mach_absolute_time ());
   // Prepare all windows or publish none. Diagnostics never decide policy.
   gPending = 0;
   gPendingProvider = this;
@@ -1124,6 +1459,7 @@ bool NativeUfs::startRoot (IOService *provider)
                           "root window preparation failed");
     return false;
   }
+  kprintf ("d114 prep n=%u t=%llx\n", gPending, mach_absolute_time ());
   return true;
 }
 

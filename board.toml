@@ -31,6 +31,12 @@ archives = [
   "build-software-aes-bindings.py",
   "build-mockfs-fixture.py",
   "build-libpthread-kernel.py",
+  # Owner root chain: the verified NativeVirtioBlock carries the root authorization query
+  # and resolves it through ShengUfs's signed windows; build-virtio-bindings.py binds its
+  # IOBlockStorageDevice imports to the same recorded original ABI as the UFS driver.
+  "build-arm-driver.py VirtioMmioBlock --verified-root",
+  "build-virtio-bindings.py",
+  "build-tb365fc-root-key.py",
   "component:ShengUfs",
   "build-ufs-bindings.py",
 ]

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 #pragma once
 // Shared production parser. Requires hostRead4k, SHA256, diagnostics and C memory primitives.
-// ---- LUN 0 GPT and the root-image manifest -------------------------------------------------
+// ---- userdata-LUN GPT and the root-image manifest ------------------------------------------
 struct RootWindow {
   char name[32];
   uint64_t offset;   // bytes from the start of the userdata partition
@@ -10,7 +10,7 @@ struct RootWindow {
 };
 
 struct RootLayout {
-  uint64_t userdataFirst, userdataLast;   // 4096-byte LBAs on LUN 0
+  uint64_t userdataFirst, userdataLast;   // 4096-byte LBAs on the userdata LUN
   uint64_t imageBytes;                    // size of the flashed root image from the manifest (0 when none)
   uint64_t gptEntriesLba;                 // GPT facts recorded for the persistent store's before/after comparison
   uint32_t gptHeaderCrc, gptEntriesCrc, gptEntryCount;
@@ -54,24 +54,44 @@ static bool rootEntryUsed (const uint8_t *entry)
   return used != 0;
 }
 
-// Find the partition named "userdata" in LUN 0's primary GPT (4096-byte sectors), then read the
+// Find the partition named "userdata" in the userdata LUN's primary GPT (4096-byte sectors), then read the
 // manifest at its first block. Read-only. Returns false only if the GPT itself is unusable.
 static bool findRootLayout (RootLayout *layout, const char **why)
 {
   gRootDiagnostic.stage = "GPT header";
   bzero (layout, sizeof (*layout));
-  if (hostRead4k (0, 1, 1, gScratch) != kIOReturnSuccess) {
+  if (gRootDiagnosticEnabled) {
+    // diag94 LU map: LUN 0 LBA 0 begins with the MTK boot-LU header "UFS_" (5f534655);
+    // the userdata LUN LBA 0 is the protective MBR (expected EB 3C 90, 0x00903ceb). The
+    // first diag94 read of it hit a pending unit attention; hostRead4k now re-issues once.
+    if (hostRead4k (0, 0, 1, gScratch) == kIOReturnSuccess) gRootDiagnostic.dataLu0 = le32 (gScratch);
+    if (hostRead4k (kUserdataLun, 0, 1, gScratch) == kIOReturnSuccess) gRootDiagnostic.dataMbr = le32 (gScratch);
+  }
+  if (hostRead4k (kUserdataLun, 1, 1, gScratch) != kIOReturnSuccess) {
     *why = "GPT header read";
     return false;
   }
+  // diag91: this READ(10) completed with scsi=0/residual=0 yet the checks below still failed, although the stock
+  // header validates offline (CRC 0x50ad1ee5, entries CRC 0x6e7bfe3f). Record what actually came back before judging.
+  gRootDiagnostic.gheadMagic0 = le32 (gScratch);
+  gRootDiagnostic.gheadMagic1 = le32 (gScratch + 4);
+  gRootDiagnostic.gheadCrc = le32 (gScratch + 16);
+  gRootDiagnostic.gheadEntriesLba = le64 (gScratch + 72);
+  gRootDiagnostic.gheadEntriesCount = le32 (gScratch + 80);
+  gRootDiagnostic.gheadFirst = le64 (gScratch + 40);
+  gRootDiagnostic.gheadLast = le64 (gScratch + 48);
+  gRootDiagnostic.gheadBackup = le64 (gScratch + 32);
   if (le32 (gScratch) != 0x20494645U || le32 (gScratch + 4) != 0x54524150U || le32 (gScratch + 84) != 128) {
     *why = "GPT header";
     return false;
   }
   uint32_t headerBytes = le32 (gScratch + 12);
+  // Clamp the CRC span: headerBytes is device data and an out-of-range value must not walk past gScratch.
+  uint32_t headerCrc = rootCrc32 (gScratch, headerBytes >= 92 && headerBytes <= 4096 ? headerBytes : 92, true);
+  gRootDiagnostic.gheadCrcCalc = headerCrc;
   if (le32 (gScratch + 8) != 0x00010000 || headerBytes < 92 || headerBytes > 4096 ||
       le32 (gScratch + 20) || le64 (gScratch + 24) != 1 ||
-      rootCrc32 (gScratch, headerBytes, true) != le32 (gScratch + 16)) {
+      headerCrc != le32 (gScratch + 16)) {
     *why = "GPT header CRC/revision";
     return false;
   }
@@ -95,7 +115,7 @@ static bool findRootLayout (RootLayout *layout, const char **why)
     return false;
   }
   gRootDiagnostic.stage = "GPT entries";
-  if (hostRead4k (0, entriesLba, blocks, gScratch) != kIOReturnSuccess) {
+  if (hostRead4k (kUserdataLun, entriesLba, blocks, gScratch) != kIOReturnSuccess) {
     *why = "GPT entries read";
     return false;
   }
@@ -109,7 +129,10 @@ static bool findRootLayout (RootLayout *layout, const char **why)
     const uint8_t *entry = gScratch + index * 128;
     if (!rootEntryUsed (entry)) continue;
     uint64_t entryFirst = le64 (entry + 32), entryLast = le64 (entry + 40);
-    if (entryFirst < first || entryLast < entryFirst || entryLast > last) {
+    // diag94: MTK places "misc" (slot metadata) at LBA 0x8, below the header's first usable
+    // LBA 0x22, so existing partitions are not required to sit inside the usable range.
+    // Only a reversed range is corrupt here; userdata gets the strict check when matched.
+    if (entryLast < entryFirst) {
       *why = "GPT partition bounds";
       return false;
     }
@@ -132,6 +155,10 @@ static bool findRootLayout (RootLayout *layout, const char **why)
         *why = "duplicate userdata partition";
         return false;
       }
+      if (entryFirst < first || entryLast > last) {
+        *why = "userdata partition bounds";
+        return false;
+      }
       layout->userdataFirst = le64 (entry + 32);
       layout->userdataLast = le64 (entry + 40);
       found = true;
@@ -145,9 +172,15 @@ static bool findRootLayout (RootLayout *layout, const char **why)
   gRootDiagnostic.last = layout->userdataLast;
   gRootDiagnostic.stage = "root manifest";
   // First block of the partition: manifest if the root image was flashed, ext4 otherwise.
-  if (hostRead4k (0, layout->userdataFirst, 1, gScratch) != kIOReturnSuccess) {
+  if (hostRead4k (kUserdataLun, layout->userdataFirst, 1, gScratch) != kIOReturnSuccess) {
     *why = "userdata first block read";
     return false;
+  }
+  if (gRootDiagnosticEnabled) {
+    // diag94: the stock userdata is F2FS; its superblock magic sits at byte 1024 of the first block.
+    for (unsigned index = 0; index + 3 < 4096; ++index) {
+      if (le32 (gScratch + index) == 0xf2f52010U) { gRootDiagnostic.dataF2 = 0xf2f52010U; gRootDiagnostic.dataF2At = index; break; }
+    }
   }
   layout->magic0 = le32 (gScratch);
   layout->magic1 = le32 (gScratch + 4);
