@@ -225,3 +225,21 @@ evidence = [
   { kind = "device", reference = "tools/collect-device-info.sh", command = "adb shell su -c 'dd if=/dev/block/sdc19 bs=1M count=1 | od -An -tx1'; adb shell su -c 'ls -la /sys/fs/pstore'", revision = "5ba47e6284567baa3450f9d82b5d56963cd14035", result = "pstore partition holds only zeroes; the live console-ramoops files appear only in /sys/fs/pstore after a reboot." },
   { kind = "device", reference = "tools/collect-device-info.sh", command = "adb shell su -c cat /proc/pl_lk; adb shell su -c cat /sys/fs/pstore/console-ramoops-0", revision = "ce3fb214d55f674ef937781e076c8f8f36ed08a5", result = "Captured the LK ring and the previous kernel console tail; the LK ring carries the panel and backlight facts recorded above." },
 ]
+
+[[area]]
+id = "userland"
+status = "device-verified"
+components = ["ShengUfs", "NativeVirtioBlock"]
+paths = ["drivers/ShengUfs/**", "package/root-key/**", "scripts/make-tb365fc-root-policy.py", "configs/tb365fc_defconfig"]
+inputs = ["The A04RPOL1 owner root policy over the OS/SystemOS windows in userdata.", "The official StaticTrustCache + Cryptex1,SystemTrustCache bundle rebuilt from the target IPSW.", "boot_a with the UEFI FD whose memory map reserves the live device-tree carveouts; vendor_boot_a with the payload carrying the trust bundle."]
+configuration = ["CONFIG_XNU_OWNER_ROOT_AUDIT/OWNER_ROOT_TRUST, CONFIG_XNU_OWNER_CACHE_MOUNT/OWNER_CACHE_STARTUP and CONFIG_XNU_OWNER_CACHE_VOLUME_UUID=8846FE78-2910-4297-AF97-D59BB6F8FC16 are enabled.", "The payload trust cache is the rebuilt two-module Apple bundle (sha256 7416ca4f8377146626bb284e2133c76bee6cb4e3ee0af5d648b186235a7323a7) accepted by the OS profile."]
+procedure = ["Flash boot_a and vendor_boot_a, boot to the bigtext console, and read the d134/d135 probe lines from the console."]
+findings = ["The root volume mounts and the SystemOS cryptex mounts read-only and authorizes: d134 cache stage=6 st=0 mnt=0 ro=1 auth=1 rr=1 sel=1000002 mntd=1000002 path=/dev/disk1s1.", "launchd is alive as pid 1 (stat=2 SRUN, flag=0x4004) with no initproc SIGKILL panic during 15 minutes.", "execs stays at 1: launchd does not spawn any child, because the writable /private/var Data volume (official Data seed) is absent."]
+completion = ["Root volume mounts; launchd execs and stays running."]
+limits = ["Userland services do not start without the Data seed; the graphical UI additionally requires an MTK GPU driver that does not exist in this tree."]
+next_action = ["Provide a writable APFS Data seed and enable OWNER_DATA_MOUNT; the official seed generator needs macOS hdiutil, and the Linux route needs a RamBlock provider or a smaller APFS formatter."]
+evidence = [
+  { kind = "device", reference = "diag134 vendor_boot (58920960 bytes, sha256 d91acf96dd6e1aa5f0ca06ae14c7dcb70a9be3526ab829ae19f85f75d4e33693) bigtext console", command = "fastboot flash vendor_boot_a diag134-vendor_boot.img; boot", revision = "191629a", result = "d134 cache stage=6 st=0 mnt=0 ro=1 auth=1 rr=1 sel=1000002 mntd=1000002 path=/dev/disk1s1; no panic for 15 minutes." },
+  { kind = "device", reference = "diag135 vendor_boot (58920960 bytes, sha256 b9475838d6dc7441f8a3ecad93433c06791117e4c27e29e0c5c7972a1e226d29) bigtext console", command = "fastboot flash vendor_boot_a diag135-vendor_boot.img; boot", revision = "191629a", result = "d135 init pid=1 stat=2 flag=4004 execs=1; launchd alive but no child execs." },
+]
+
