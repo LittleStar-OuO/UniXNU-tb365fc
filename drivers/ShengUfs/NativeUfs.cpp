@@ -35,6 +35,8 @@ extern "C" {
 extern const struct vr_crypto vr_xnu_crypto;
 extern const uint8_t verified_root_key[];
 #endif
+// Legacy display client gate: the probe defines this; other boards leave it out.
+extern volatile int native_legacy_client_status __attribute__((weak));
 volatile uint32_t native_ufs_probe_calls = 0;
 volatile uint32_t native_ufs_matched = 0;
 volatile uint32_t native_ufs_probe_requested = 0;

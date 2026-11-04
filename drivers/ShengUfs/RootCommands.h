@@ -84,14 +84,22 @@ static IOReturn hostSubmit (uint32_t direction, uint32_t dataBytes, uint32_t tim
   HardwareTransferPort port;
   static unsigned d112Submits = 0;
   static unsigned d114Submits = 0;
-  bool verb = d112Submits < 16;
+  // A userland display client shares this framebuffer. Any console line
+  // scrolls the text grid and paints over its frame, so stop tracing as soon
+  // as the legacy display reports a client. The weak C declaration lives at
+  // global scope in NativeUfs.cpp; boards without the archive read -1/absent.
+  const bool quiet = (&::native_legacy_client_status != nullptr) &&
+      (::native_legacy_client_status >= 0);
+  bool verb = !quiet && (d112Submits < 16);
   if (verb) {
     d112Submits++;
     kprintf ("d112 hs%u pre db=%x is=%x t=%llx\n", d112Submits,
         read32 (gHost.hc, 0x58), read32 (gHost.hc, 0x20), mach_absolute_time ());
-  } else if ((++d114Submits & 255) == 0) {
-    // diag114: silent submits hid where the root I/O loop went. Every 256th one
-    // names opcode, LUN, direction, bytes and LBA (READ/WRITE 10/16).
+  } else if (!quiet && (++d114Submits & 4095) == 0) {
+    // diag114: silent submits hid where the root I/O loop went. Every 4096th one
+    // names opcode, LUN, direction, bytes and LBA (READ/WRITE 10/16). The userland
+    // boot issues thousands of 4 KiB reads per minute, so a 256 rate floods the
+    // console and slows the polling path that must still meet its deadline.
     const uint8_t *cdb = reinterpret_cast<const uint8_t *> (gHost.virt) + kUcdOffset + 16;
     uint32_t op = gRootDiagnostic.opcode;
     uint64_t lba = 0;
