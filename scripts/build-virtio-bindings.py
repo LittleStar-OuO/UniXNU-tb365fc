@@ -63,6 +63,8 @@ subprocess.run(['xcrun', 'clang', '-target', 'arm64-apple-ios17.0', '-Werror',
 archive = out / 'libVirtioMmioBlock.a'
 archive.unlink(missing_ok=True)
 subprocess.run(['xcrun', 'ar', 'rcs', archive, obj_path], check=True)
+# The XNU link cross-check names the object after the archive component.
+(out / 'VirtioMmioBlock.o').write_bytes(obj)
 (out / 'bindings.json').write_text(json.dumps(dict(
     source_kernelcache_sha256='f18b4df865405f2a287b84977d7aca745e056d656d9fc9df1662970ce2969de7',
     ordinary_storage_abi=True, compiled_object_sha256=hashlib.sha256(obj).hexdigest(),

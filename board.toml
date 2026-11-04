@@ -14,7 +14,7 @@ kit = "tb365fc"
 [components]
 # Storage is the MT6835 fork of ShengUfs (drivers/ShengUfs, local.toml override); it
 # keeps the official build recipe and transport headers, with the MTK host window.
-include = ["ArmDTPlatform", "ArmCpu", "SoftwareAES", "XnuPrelink", "DarwinBoot", "ShengUfs"]
+include = ["ArmDTPlatform", "ArmCpu", "SoftwareAES", "XnuPrelink", "DarwinBoot", "ShengUfs", "RamBlock"]
 
 [kernel]
 defconfig = "tb365fc_defconfig"
@@ -36,6 +36,10 @@ archives = [
   # IOBlockStorageDevice imports to the same recorded original ABI as the UFS driver.
   "build-arm-driver.py VirtioMmioBlock --verified-root",
   "build-virtio-bindings.py",
+  # The owner Data seed is a RAM-backed block device: build the official
+  # NativeRamBlock object and bind its storage imports to the same ABI.
+  "component:RamBlock",
+  "build-ram-block-bindings.py",
   "build-tb365fc-root-key.py",
   "component:ShengUfs",
   "build-ufs-bindings.py",
@@ -90,7 +94,11 @@ volume = "TB365FC"
 size_mib = 56
 loader = "firmware"
 title = "UniXNU"
-kernel_args = ["-v", "serial=3", "debug=0x14e", "-enable_kprintf_spam", "sheng-pmgr=2", "native-ufs-root=1", "native-ufs-diagnostics=1"]
+# native-4k-trust-cache is a bring-up accelerator: it skips the 3.4 GB
+# shared-cache hash pass (the SystemOS volume is owner-authorized read-only)
+# so a failed dyld map can be reproduced without a one-hour read. Remove it
+# once the userspace bring-up no longer needs the faster loop.
+kernel_args = ["-v", "serial=3", "debug=0x14e", "-enable_kprintf_spam", "sheng-pmgr=2", "native-ufs-root=1", "native-ufs-diagnostics=1", "native-4k-trust-cache=1"]
 
 [payload.adt]
 # A stable software identity seed for this board, not an Apple silicon chip ID.
@@ -100,6 +108,11 @@ unique_chip_id = "required"
 # Root volume of the OS window (044-76040-038.dmg, iPad7,1 17.7.11): the UUID the
 # APFS media publishes, as recorded by UniXNU's owner-policy tooling for this IPSW.
 root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"
-# Continuous DarwinBoot window, 256 MiB; accepted range is 256 MiB to 8 GiB in 2 MiB steps.
-owned_memory_size = "0x10000000"
+# Continuous DarwinBoot window, 512 MiB; the 128 MiB Data seed and the 73 MB
+# owner policy must both fit inside it. Accepted range is 256 MiB to 8 GiB.
+owned_memory_size = "0x20000000"
+# The Data seed travels as a zero-page-packed DBRDISK1 image: keep it packed in
+# the ADT (PackedRAMDisk) and let NativeRamBlock parse the sparse seed in place,
+# as the official booted devices do. RAMDisk would require a dense expansion.
+packed_data_ramdisk = true
 psci_method = "smc"

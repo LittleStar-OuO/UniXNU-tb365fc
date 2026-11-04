@@ -29,7 +29,17 @@ CONFIG_XNU_OWNER_ROOT_TRUST=y
 # can open the shared cache; launchd then receives DYLD_SHARED_CACHE_DIR.
 CONFIG_XNU_OWNER_CACHE_MOUNT=y
 CONFIG_XNU_OWNER_CACHE_STARTUP=y
+# The non-union owner mount puts the cache at /private/preboot, which the
+# stock shared-region setup rejects; the owner carrier authorizes exactly the
+# verified SystemOS volume and directory.
+CONFIG_XNU_OWNER_CACHE_CARRIER=y
 CONFIG_XNU_OWNER_CACHE_VOLUME_UUID="8846FE78-2910-4297-AF97-D59BB6F8FC16"
+# Userland services need a writable /private/var: mount the packed Data seed
+# (DBRDISK1) through the legacy md path and publish the authenticated manifest.
+CONFIG_XNU_OWNER_BOOT_MANIFEST=y
+CONFIG_XNU_OWNER_DATA_MOUNT=y
+CONFIG_XNU_NATIVE_RAM_BLOCK=y
+CONFIG_XNU_OWNER_DATA_VOLUME_UUID="44516143-215D-4F9C-902A-7061DB9C292B"
 CONFIG_XNU_NATIVE_VIRTIO_BLOCK_ARCHIVE="{tree}/build/virtio-mmio-block-verified/libVirtioMmioBlock.a"
 CONFIG_XNU_VERIFIED_ROOT_ARCHIVE="{tree}/build/tb365fc-root-key/libTB365FCRootKey.a"
 

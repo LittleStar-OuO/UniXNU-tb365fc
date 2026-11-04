@@ -829,6 +829,7 @@ OSDefineMetaClassAndStructors (NativeUfsBlock, IOBlockStorageDevice)
 extern "C" {
 volatile uint32_t native_ufs_blocks_published = 0;
 volatile uint64_t native_ufs_block_reads = 0;
+volatile uint64_t native_ufs_bytes_read = 0;
 volatile uint64_t native_ufs_block_failures = 0;
 }
 
@@ -1006,7 +1007,10 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
     }
     uint64_t copy (uint64_t offset, const void *data, uint64_t length) {
       uint64_t copied = buffer->writeBytes (offset, data, length);
-      if (copied == length) __atomic_fetch_add (&native_ufs_block_reads, 1, __ATOMIC_RELAXED);
+      if (copied == length) {
+        __atomic_fetch_add (&native_ufs_block_reads, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add (&native_ufs_bytes_read, length, __ATOMIC_RELAXED);
+      }
       return copied;
     }
   } operations = { windowLock, buffer, this };
@@ -1361,6 +1365,16 @@ bool NativeUfs::startRoot (IOService *provider)
   kprintf ("d114 layout w=%u first=%llx last=%llx img=%llx ms=%u t=%llx\n",
       layout->windows, layout->userdataFirst, layout->userdataLast, layout->imageBytes,
       layout->manifestStatus, mach_absolute_time ());
+  {
+    uint64_t benchLba = layout->userdataFirst + layout->window[0].offset / 4096;
+    uint64_t benchStart = mach_absolute_time ();
+    unsigned benchOk = 0;
+    for (unsigned i = 0; i < 128; ++i) {
+      if (hostRead4k (kUserdataLun, benchLba + i * 32, 32, gScratch) == kIOReturnSuccess) ++benchOk;
+    }
+    kprintf ("d144 bench n=128 ok=%u t0=%llx t1=%llx\n", benchOk, benchStart,
+        mach_absolute_time ());
+  }
   native_ufs_root_step = 3;
   if (layout->manifestStatus != 0) {
     rootDiagnosticFailure ("root manifest rejected");
