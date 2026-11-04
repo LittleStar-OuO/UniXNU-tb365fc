@@ -45,3 +45,8 @@ CONFIG_XNU_VERIFIED_ROOT_ARCHIVE="{tree}/build/tb365fc-root-key/libTB365FCRootKe
 
 # Display, input and GPU gates are added area by area once the hardware
 # inventory in porting.toml is complete.
+# Legacy MobileFramebuffer backend on the firmware frame buffer. The late
+# archive is built by scripts/build-display-archive.py from the audited
+# original class; the key store and HID probes are stubs in this first step.
+CONFIG_XNU_NATIVE_MOBILE_DISPLAY=n
+CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y

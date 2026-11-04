@@ -14,7 +14,7 @@ kit = "tb365fc"
 [components]
 # Storage is the MT6835 fork of ShengUfs (drivers/ShengUfs, local.toml override); it
 # keeps the official build recipe and transport headers, with the MTK host window.
-include = ["ArmDTPlatform", "ArmCpu", "SoftwareAES", "XnuPrelink", "DarwinBoot", "ShengUfs", "RamBlock"]
+include = ["ArmDTPlatform", "ArmCpu", "SoftwareAES", "XnuPrelink", "DarwinBoot", "ShengUfs", "RamBlock", "GopFramebuffer"]
 
 [kernel]
 defconfig = "tb365fc_defconfig"
@@ -43,6 +43,9 @@ archives = [
   "build-tb365fc-root-key.py",
   "component:ShengUfs",
   "build-ufs-bindings.py",
+  # Legacy display backend: NativeLegacyDisplay + NativeGOPPresenter + the
+  # board probe against the audited original class (key/HID stubs first).
+  "build-display-archive.py",
 ]
 
 [device_tree]
@@ -98,7 +101,7 @@ title = "UniXNU"
 # shared-cache hash pass (the SystemOS volume is owner-authorized read-only)
 # so a failed dyld map can be reproduced without a one-hour read. Remove it
 # once the userspace bring-up no longer needs the faster loop.
-kernel_args = ["-v", "serial=3", "debug=0x14e", "-enable_kprintf_spam", "sheng-pmgr=2", "native-ufs-root=1", "native-ufs-diagnostics=1", "native-4k-trust-cache=1"]
+kernel_args = ["-v", "serial=3", "debug=0x14e", "-enable_kprintf_spam", "sheng-pmgr=2", "native-ufs-root=1", "native-ufs-diagnostics=1", "native-4k-trust-cache=1", "offline-mobile-graphics-load=1", "offline-mobile-graphics-client=1", "offline-legacy-register=1", "offline-legacy-phase=4", "offline-legacy-gop=1", "offline-legacy-unit-scale=2", "offline-legacy-pm=1", "offline-legacy-validate=1", "offline-legacy-transfer=1", "offline-legacy-cpu-present=1"]
 
 [payload.adt]
 # A stable software identity seed for this board, not an Apple silicon chip ID.
