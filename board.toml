@@ -101,7 +101,7 @@ title = "UniXNU"
 # shared-cache hash pass (the SystemOS volume is owner-authorized read-only)
 # so a failed dyld map can be reproduced without a one-hour read. Remove it
 # once the userspace bring-up no longer needs the faster loop.
-kernel_args = ["-v", "serial=3", "debug=0x14e", "-enable_kprintf_spam", "sheng-pmgr=2", "native-ufs-root=1", "native-ufs-diagnostics=1", "native-4k-trust-cache=1", "offline-mobile-graphics-load=1", "offline-mobile-graphics-client=1", "offline-legacy-register=1", "offline-legacy-phase=4", "offline-legacy-gop=1", "offline-legacy-unit-scale=2", "offline-legacy-pm=1", "offline-legacy-validate=1", "offline-legacy-transfer=1", "offline-legacy-cpu-present=1"]
+kernel_args = ["-v", "serial=3", "debug=0x14e", "-enable_kprintf_spam", "sheng-pmgr=2", "native-ufs-root=1", "native-ufs-diagnostics=1", "native-4k-trust-cache=1", "offline-mobile-graphics-load=1", "offline-mobile-graphics-client=1", "offline-legacy-register=1", "offline-legacy-phase=4", "offline-legacy-gop=1", "offline-legacy-unit-scale=2", "offline-legacy-pm=1", "offline-legacy-validate=1", "offline-legacy-transfer=1", "offline-legacy-cpu-present=1", "sheng-log=1"]
 
 [payload.adt]
 # A stable software identity seed for this board, not an Apple silicon chip ID.

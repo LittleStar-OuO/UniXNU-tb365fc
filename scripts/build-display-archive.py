@@ -270,6 +270,26 @@ cmd += ['-Wall', '-Wextra', '-Wno-unused-parameter', '-Wno-missing-designated-fi
         '-Wno-c99-designator', '-Wno-reorder-init-list', '-Wno-deprecated-enum-enum-conversion',
         '-I', str(ROOT / '.cache/xnu-work/osfmk')]
 run(cmd, cwd=record['directory'])
+bootlog_source = ROOT / 'kits/tb365fc/BootLog.cpp'
+require(bootlog_source.exists(), 'Missing kits/tb365fc/BootLog.cpp')
+cmd = []
+i = 0
+while i < len(args):
+    value = args[i]
+    if value == record['file']:
+        cmd.append(str(bootlog_source))
+    elif value == '-o':
+        cmd += ['-o', str(OUT / 'BootLog.o')]
+        i += 1
+    elif value == '-Xclang' and args[i + 1].startswith('-W'):
+        i += 1
+    elif not value.startswith('-W'):
+        cmd.append(value)
+    i += 1
+cmd += ['-Wall', '-Wextra', '-Wno-unused-parameter', '-Wno-missing-designated-field-initializers',
+        '-Wno-c99-designator', '-Wno-reorder-init-list', '-Wno-deprecated-enum-enum-conversion',
+        '-I', str(ROOT / '.cache/xnu-work/osfmk')]
+run(cmd, cwd=record['directory'])
 stub = OUT / 'tb365fc-display-stubs.c'
 stub.write_text('''/* Providers that the QEMU board links and TB365FC does not have: the
    QEMU display probes, a panel vsync source, the MTK DPU scanout hooks, and
@@ -308,10 +328,11 @@ require(code((gop / 'NativeGOPPresenter.o').read_bytes(), macho((gop / 'NativeGO
 archive = OUT / 'libNativeLegacyDisplay.late.a'
 archive.unlink(missing_ok=True)
 run([llvm_ar, 'rcs', archive, late, OUT / 'original-bindings.o', OUT / 'LegacyDisplayProbe.o',
-     OUT / 'tb365fc-display-stubs.o', gop_late])
+     OUT / 'BootLog.o', OUT / 'tb365fc-display-stubs.o', gop_late])
 report_sources = ['drivers/GopFramebuffer/NativeLegacyDisplay.cpp',
                   'drivers/GopFramebuffer/NativeGOPPresenter.cpp',
-                  'kits/tb365fc/LegacyDisplayProbe.cpp']
+                  'kits/tb365fc/LegacyDisplayProbe.cpp',
+                  'kits/tb365fc/BootLog.cpp']
 (OUT / 'build-report.json').write_text(json.dumps(dict(
     source_sha256={name: sha(ROOT / name) for name in report_sources},
     generated_abi_sha256=sha(OUT / 'OriginalLegacyFramebufferABI.h'),
