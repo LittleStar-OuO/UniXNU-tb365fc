@@ -2,12 +2,13 @@
 // Touch resource inspection: the input adaptation's first stage. Reads the
 // SPI3 controller window, the GPIO/IOCFG banks and the EINT instance that the
 // stock device tree assigns to the Novatek NT36532 node, without changing any
-// state. The dump is split into short lines so it survives the kernel console
-// and the persistent BootLog ring; decode it offline against the vendor
-// register layouts.
+// state. The dump prints once at the late display probe and once more from a
+// delayed thread, when the boot console has gone quiet, so the snapshot can be
+// read back from the panel or the persistent BootLog ring.
 #include <IOKit/IOService.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
+#include <kern/thread.h>
 #include <pexpert/pexpert.h>
 
 namespace {
@@ -54,13 +55,7 @@ uint32_t iocfgRead(volatile uint32_t *bank, unsigned pin) {
     return bank[((pin >> 3) * 4) + (pin & 7)];
 }
 
-}
-
-void native_touch_res_probe(void) {
-    unsigned on = 0;
-    if (!PE_parse_boot_argn("touch-res", &on, sizeof(on)) || on != 1) {
-        return;
-    }
+void dumpAll(void) {
     kprintf("trs begin\n");
     {
         ResMap spi;
@@ -111,4 +106,37 @@ void native_touch_res_probe(void) {
         }
     }
     kprintf("trs end\n");
+}
+
+void delayedDump(void *arg, wait_result_t) {
+    unsigned seconds = 420;
+    if (arg) {
+        seconds = (unsigned)(uintptr_t)arg;
+    }
+    IOSleep(seconds * 1000);
+    kprintf("trs late +%us\n", seconds);
+    dumpAll();
+}
+
+}
+
+extern "C" void native_touch_res_probe(void) {
+    unsigned on = 0;
+    if (!PE_parse_boot_argn("touch-res", &on, sizeof(on)) || on != 1) {
+        return;
+    }
+    static bool started;
+    if (started) {
+        return;
+    }
+    started = true;
+    dumpAll();
+    unsigned delay = 0;
+    if (!PE_parse_boot_argn("touch-res-delay", &delay, sizeof(delay)) || delay < 60) {
+        delay = 420;
+    }
+    thread_t thread = nullptr;
+    if (kernel_thread_start(delayedDump, (void *)(uintptr_t)delay, &thread) == KERN_SUCCESS) {
+        thread_deallocate(thread);
+    }
 }
