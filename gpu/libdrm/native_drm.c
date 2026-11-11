@@ -1,0 +1,879 @@
+// libdrm-darwin: Panfrost/PanVK userspace glue for the NativeMali accelerator.
+//
+// Mesa's panvk JM path speaks the legacy Panfrost DRM UAPI through libdrm.
+// There is no /dev/dri on XNU, so this shim implements the small libdrm
+// surface PanVK needs directly on top of the NativeMaliUserClient ABI:
+//   - synthetic render node + fd
+//   - CREATE_BO/MMAP_BO/WAIT_BO/GET_PARAM/SUBMIT ioctl translation
+//   - DRM syncobj emulation (submits are synchronous in the kernel client,
+//     so every fence is complete when the ioctl returns)
+//   - open/stat/mmap/close interception for the render node and BO mappings
+//
+// Everything here is statically linked into the PanVK ICD dylib, so the
+// interposed libc symbols only affect the GPU stack's own calls.
+
+#include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <mach/mach.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <IOKit/IOKitLib.h>
+
+#include <xf86drm.h>
+#include <drm-uapi/panfrost_drm.h>
+
+#include "NativeMaliABI.h"
+
+#ifndef _IOC_NR
+#define _IOC_NR(x) ((x) & 0xff)
+#endif
+
+#define MALI_DEVICE_PATH "/dev/dri/renderD128"
+#define MALI_FAKE_FD_BASE 0x6d610000
+
+// ---------------------------------------------------------------------------
+// Connection table
+
+struct mali_conn {
+    bool open;
+    io_connect_t conn;
+};
+
+static struct mali_conn g_conns[4];
+
+static struct mali_conn *conn_of_fd(int fd)
+{
+    int idx = fd - MALI_FAKE_FD_BASE;
+    if (idx < 0 || idx >= (int)(sizeof(g_conns) / sizeof(g_conns[0])))
+        return NULL;
+    return g_conns[idx].open ? &g_conns[idx] : NULL;
+}
+
+static int conn_to_fd(struct mali_conn *c)
+{
+    return MALI_FAKE_FD_BASE + (int)(c - g_conns);
+}
+
+static kern_return_t mali_call(struct mali_conn *c, uint32_t selector,
+    const void *in, size_t inSize, void *out, size_t outSize)
+{
+    size_t replySize = outSize;
+    return IOConnectCallStructMethod(c->conn, selector, in, inSize, out,
+                                     &replySize);
+}
+
+static int mali_open_device(void)
+{
+    for (int i = 0; i < (int)(sizeof(g_conns) / sizeof(g_conns[0])); i++) {
+        if (g_conns[i].open)
+            continue;
+        io_service_t service = IOServiceGetMatchingService(
+            kIOMainPortDefault, IOServiceMatching("AGXAccelerator"));
+        if (!service)
+            service = IOServiceGetMatchingService(
+                kIOMainPortDefault, IOServiceMatching("NativeMaliGPU"));
+        if (!service)
+            return -1;
+        io_connect_t conn = 0;
+        kern_return_t kr = IOServiceOpen(service, mach_task_self(), 0, &conn);
+        IOObjectRelease(service);
+        if (kr != KERN_SUCCESS)
+            return -1;
+        MaliAbiParams params = {};
+        kr = mali_call(&g_conns[i], kMaliAbiMethodQuery, NULL, 0, &params,
+                       sizeof(params));
+        if (kr != KERN_SUCCESS || params.abi_version != kMaliAbiVersion) {
+            IOServiceClose(conn);
+            return -1;
+        }
+        g_conns[i].open = true;
+        g_conns[i].conn = conn;
+        return conn_to_fd(&g_conns[i]);
+    }
+    return -1;
+}
+
+// ---------------------------------------------------------------------------
+// BO table (kernel handle -> VA/mmap offset)
+
+struct mali_bo {
+    uint64_t handle;
+    uint64_t va;
+    uint64_t size;
+    void *map;
+};
+
+static struct mali_bo g_bos[kMaliAbiMaxBo];
+
+/* PanVK's tiler heap and indirect-varying buffer are ALLOC_ON_FAULT and are
+ * never mapped on the host; the kernel client backs every BO with physically
+ * contiguous memory inside an 8 MiB GPU window, which a 128 MiB heap cannot
+ * use. Give those BOs a synthetic handle and a reserved GPU VA with no PTEs:
+ * nothing dereferences them before real rendering, and lazy backing is the
+ * next kernel ABI step. */
+#define MALI_SYNTH_HANDLE_BASE 0x40000000u
+#define MALI_SYNTH_VA_BASE 0x100000000ull
+#define MALI_SYNTH_STRIDE 0x20000000ull
+static struct mali_bo g_synth[kMaliAbiMaxBo];
+
+static struct mali_bo *synth_alloc(uint64_t size)
+{
+    for (int i = 0; i < kMaliAbiMaxBo; i++) {
+        if (g_synth[i].handle)
+            continue;
+        g_synth[i].handle = MALI_SYNTH_HANDLE_BASE + (uint64_t)i;
+        g_synth[i].va = MALI_SYNTH_VA_BASE + (uint64_t)i * MALI_SYNTH_STRIDE;
+        g_synth[i].size = size;
+        g_synth[i].map = NULL;
+        return &g_synth[i];
+    }
+    return NULL;
+}
+
+static struct mali_bo *synth_of(uint64_t handle)
+{
+    if (handle < MALI_SYNTH_HANDLE_BASE ||
+        handle >= MALI_SYNTH_HANDLE_BASE + kMaliAbiMaxBo)
+        return NULL;
+    struct mali_bo *bo = &g_synth[handle - MALI_SYNTH_HANDLE_BASE];
+    return bo->handle ? bo : NULL;
+}
+
+static struct mali_bo *bo_by_handle(uint64_t handle)
+{
+    struct mali_bo *synth = synth_of(handle);
+    if (synth)
+        return synth;
+    for (int i = 0; i < kMaliAbiMaxBo; i++) {
+        if (g_bos[i].handle == handle)
+            return &g_bos[i];
+    }
+    return NULL;
+}
+
+static struct mali_bo *bo_by_offset(uint64_t offset)
+{
+    if (!offset || (offset & 0xfff))
+        return NULL;
+    for (int i = 0; i < kMaliAbiMaxBo; i++) {
+        if (g_bos[i].handle && g_bos[i].va == offset)
+            return &g_bos[i];
+    }
+    for (int i = 0; i < kMaliAbiMaxBo; i++) {
+        if (g_synth[i].handle && g_synth[i].va == offset)
+            return &g_synth[i];
+    }
+    return NULL;
+}
+
+static int mali_bo_alloc(struct mali_conn *c, uint64_t bytes, uint64_t *handle,
+    uint64_t *va, uint64_t *size)
+{
+    MaliAbiBoAllocRequest req = { .bytes = bytes, .align_log2 = 12, .flags = 0 };
+    MaliAbiHandle reply = {};
+    kern_return_t kr = mali_call(c, kMaliAbiMethodBoAlloc, &req, sizeof(req),
+                                 &reply, sizeof(reply));
+    if (kr != KERN_SUCCESS || !reply.handle)
+        return -1;
+    for (int i = 0; i < kMaliAbiMaxBo; i++) {
+        if (!g_bos[i].handle) {
+            g_bos[i].handle = reply.handle;
+            g_bos[i].va = reply.va;
+            g_bos[i].size = reply.size;
+            g_bos[i].map = NULL;
+            *handle = reply.handle;
+            *va = reply.va;
+            *size = reply.size;
+            return 0;
+        }
+    }
+    MaliAbiHandle freeReq = { .handle = reply.handle };
+    mali_call(c, kMaliAbiMethodBoFree, &freeReq, sizeof(freeReq), NULL, 0);
+    return -1;
+}
+
+static void mali_bo_free(struct mali_conn *c, uint64_t handle)
+{
+    struct mali_bo *bo = bo_by_handle(handle);
+    MaliAbiHandle req = { .handle = handle };
+    mali_call(c, kMaliAbiMethodBoFree, &req, sizeof(req), NULL, 0);
+    if (bo) {
+        if (bo->map && bo->map != MAP_FAILED)
+            munmap(bo->map, bo->size);
+        memset(bo, 0, sizeof(*bo));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// libc interposition helpers
+
+static void *real_symbol(const char *name)
+{
+    void *sym = dlsym(RTLD_NEXT, name);
+    if (!sym)
+        sym = dlsym(RTLD_DEFAULT, name);
+    return sym;
+}
+
+// ---------------------------------------------------------------------------
+// Syncobj emulation
+
+#define MALI_MAX_SYNCOBJ 128
+
+struct mali_syncobj {
+    bool used;
+    bool signaled;
+    uint64_t point;
+    uint32_t payload;
+};
+
+static struct mali_syncobj g_syncobjs[MALI_MAX_SYNCOBJ];
+static uint32_t g_syncobj_next = 1;
+
+static struct mali_syncobj *syncobj_of(uint32_t handle)
+{
+    if (handle < 1 || handle > MALI_MAX_SYNCOBJ)
+        return NULL;
+    struct mali_syncobj *s = &g_syncobjs[handle - 1];
+    return s->used ? s : NULL;
+}
+
+static uint32_t syncobj_alloc(bool signaled)
+{
+    for (uint32_t i = 0; i < MALI_MAX_SYNCOBJ; i++) {
+        uint32_t h = g_syncobj_next++;
+        if (g_syncobj_next > MALI_MAX_SYNCOBJ)
+            g_syncobj_next = 1;
+        struct mali_syncobj *s = &g_syncobjs[h - 1];
+        if (!s->used) {
+            s->used = true;
+            s->signaled = signaled;
+            s->point = 0;
+            s->payload = 0;
+            return h;
+        }
+    }
+    return 0;
+}
+
+static int syncobj_wait_one(struct mali_syncobj *s, uint64_t point,
+    int64_t timeout_ns)
+{
+    if (!s)
+        return -EINVAL;
+    if (s->signaled && s->point >= point)
+        return 0;
+    if (timeout_ns == 0)
+        return -ETIMEDOUT;
+    // Submits are synchronous, so nothing will signal these later unless a
+    // background thread does. Time out instead of hanging forever.
+    int64_t waited = 0;
+    while (waited < timeout_ns) {
+        usleep(1000);
+        waited += 1000000;
+        if (s->signaled && s->point >= point)
+            return 0;
+    }
+    return -ETIMEDOUT;
+}
+
+// ---------------------------------------------------------------------------
+// drmIoctl translation
+
+// BSD ioctl encoding keeps the command number in the low byte, the same
+// layout the Linux DRM UAPI uses.
+#define SHIM_IOC_NR(cmd) ((cmd) & 0xff)
+
+static int mali_ioctl_submit(struct mali_conn *c, struct drm_panfrost_submit *a)
+{
+    const uint32_t *in_syncs = (const uint32_t *)(uintptr_t)a->in_syncs;
+    for (uint32_t i = 0; i < a->in_sync_count; i++) {
+        struct mali_syncobj *s = syncobj_of(in_syncs[i]);
+        if (s && !s->signaled) {
+            if (syncobj_wait_one(s, 0, 1000000000LL) != 0)
+                return -ETIMEDOUT;
+        }
+    }
+    MaliAbiSubmitRequest req = {};
+    req.head_va = a->jc;
+    req.flags = a->requirements;
+    const uint32_t *handles = (const uint32_t *)(uintptr_t)a->bo_handles;
+    for (uint32_t i = 0; i < a->bo_handle_count && i < kMaliAbiMaxBuffers; i++) {
+        struct mali_bo *bo = bo_by_handle(handles[i]);
+        req.buffers[req.buffer_count++] = bo ? bo->va : 0;
+    }
+    MaliAbiSubmitReply reply = {};
+    kern_return_t kr = mali_call(c, kMaliAbiMethodSubmit, &req, sizeof(req),
+                                 &reply, sizeof(reply));
+    struct mali_syncobj *out = syncobj_of(a->out_sync);
+    if (out) {
+        out->signaled = true;
+        out->point = reply.fence ? reply.fence : 1;
+        out->payload = (uint32_t)reply.fence;
+    }
+    return kr == KERN_SUCCESS ? 0 : -EIO;
+}
+
+static int mali_ioctl_get_param(struct mali_conn *c,
+    struct drm_panfrost_get_param *a)
+{
+    MaliAbiQueryParamRequest req = { .param = a->param };
+    MaliAbiQueryParamReply reply = {};
+    kern_return_t kr = mali_call(c, kMaliAbiMethodQueryParam, &req, sizeof(req),
+                                 &reply, sizeof(reply));
+    if (kr != KERN_SUCCESS)
+        return -EINVAL;
+    a->value = reply.value;
+    return 0;
+}
+
+int drmIoctl(int fd, unsigned long request, void *arg)
+{
+    struct mali_conn *c = conn_of_fd(fd);
+    if (!c) {
+        int (*real_ioctl)(int, unsigned long, void *) =
+            (int (*)(int, unsigned long, void *))real_symbol("ioctl");
+        if (real_ioctl)
+            return real_ioctl(fd, request, arg);
+        errno = EBADF;
+        return -1;
+    }
+
+    unsigned nr = request & 0xff;
+    switch (nr) {
+    case DRM_COMMAND_BASE + DRM_PANFROST_SUBMIT:
+        return mali_ioctl_submit(c, arg) ? (errno = EIO, -1) : 0;
+    case DRM_COMMAND_BASE + DRM_PANFROST_CREATE_BO: {
+        struct drm_panfrost_create_bo *a = arg;
+        if (a->flags & PANFROST_BO_HEAP) {
+            struct mali_bo *bo = synth_alloc(a->size);
+            if (!bo) {
+                errno = ENOMEM;
+                return -1;
+            }
+            a->handle = (uint32_t)bo->handle;
+            a->offset = bo->va;
+            return 0;
+        }
+        uint64_t handle = 0, va = 0, size = 0;
+        if (mali_bo_alloc(c, a->size, &handle, &va, &size) != 0) {
+            errno = ENOMEM;
+            return -1;
+        }
+        a->handle = (uint32_t)handle;
+        a->offset = va;
+        return 0;
+    }
+    case DRM_COMMAND_BASE + DRM_PANFROST_MMAP_BO: {
+        struct drm_panfrost_mmap_bo *a = arg;
+        struct mali_bo *bo = bo_by_handle(a->handle);
+        if (!bo) {
+            errno = EINVAL;
+            return -1;
+        }
+        a->offset = bo->va;
+        return 0;
+    }
+    case DRM_COMMAND_BASE + DRM_PANFROST_GET_BO_OFFSET: {
+        struct drm_panfrost_get_bo_offset *a = arg;
+        struct mali_bo *bo = bo_by_handle(a->handle);
+        if (!bo) {
+            errno = EINVAL;
+            return -1;
+        }
+        a->offset = bo->va;
+        return 0;
+    }
+    case DRM_COMMAND_BASE + DRM_PANFROST_WAIT_BO: {
+        struct drm_panfrost_wait_bo *a = arg;
+        if (!bo_by_handle(a->handle)) {
+            errno = EINVAL;
+            return -1;
+        }
+        return 0; // submits are synchronous
+    }
+    case DRM_COMMAND_BASE + DRM_PANFROST_GET_PARAM:
+        return mali_ioctl_get_param(c, arg);
+    case DRM_COMMAND_BASE + DRM_PANFROST_MADVISE:
+    case DRM_COMMAND_BASE + DRM_PANFROST_SET_LABEL_BO:
+    case DRM_COMMAND_BASE + DRM_PANFROST_SYNC_BO:
+        return 0; // cache maintenance happens at submit time
+    case DRM_COMMAND_BASE + DRM_PANFROST_QUERY_BO_INFO: {
+        struct drm_panfrost_query_bo_info *a = arg;
+        struct mali_bo *bo = bo_by_handle(a->handle);
+        if (!bo) {
+            errno = EINVAL;
+            return -1;
+        }
+        memset(a, 0, sizeof(*a));
+        a->handle = (uint32_t)bo->handle;
+        return 0;
+    }
+    case DRM_COMMAND_BASE + DRM_PANFROST_PERFCNT_ENABLE:
+    case DRM_COMMAND_BASE + DRM_PANFROST_PERFCNT_DUMP:
+        return 0;
+    case DRM_COMMAND_BASE + DRM_PANFROST_JM_CTX_CREATE:
+    case DRM_COMMAND_BASE + DRM_PANFROST_JM_CTX_DESTROY:
+        return 0;
+    default:
+        break;
+    }
+
+    // Generic DRM ioctls (syncobj family lives here).
+    if (_IOC_NR(request) == SHIM_IOC_NR(DRM_IOCTL_SYNCOBJ_CREATE)) {
+        struct drm_syncobj_create *a = arg;
+        uint32_t h = syncobj_alloc(a->flags & DRM_SYNCOBJ_CREATE_SIGNALED);
+        if (!h) {
+            errno = ENOMEM;
+            return -1;
+        }
+        a->handle = h;
+        return 0;
+    }
+    if (_IOC_NR(request) == SHIM_IOC_NR(DRM_IOCTL_SYNCOBJ_DESTROY)) {
+        struct drm_syncobj_destroy *a = arg;
+        struct mali_syncobj *s = syncobj_of(a->handle);
+        if (s)
+            memset(s, 0, sizeof(*s));
+        return 0;
+    }
+    if (_IOC_NR(request) == SHIM_IOC_NR(DRM_IOCTL_SYNCOBJ_WAIT) ||
+        _IOC_NR(request) == SHIM_IOC_NR(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT)) {
+        // PanVK only waits on fence fds it has just received from a
+        // synchronous submit, so treat waits as satisfiable and succeed.
+        return 0;
+    }
+    if (_IOC_NR(request) == SHIM_IOC_NR(DRM_IOCTL_SYNCOBJ_TRANSFER)) {
+        struct drm_syncobj_transfer *a = arg;
+        struct mali_syncobj *dst = syncobj_of(a->dst_handle);
+        struct mali_syncobj *src = syncobj_of(a->src_handle);
+        if (!dst || !src) {
+            errno = EINVAL;
+            return -1;
+        }
+        dst->point = src->point;
+        dst->signaled = src->signaled;
+        return 0;
+    }
+    if (_IOC_NR(request) == SHIM_IOC_NR(DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD) ||
+        _IOC_NR(request) == SHIM_IOC_NR(DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE) ||
+        _IOC_NR(request) == SHIM_IOC_NR(DRM_IOCTL_SYNCOBJ_QUERY) ||
+        _IOC_NR(request) == SHIM_IOC_NR(DRM_IOCTL_SYNCOBJ_RESET) ||
+        _IOC_NR(request) == SHIM_IOC_NR(DRM_IOCTL_SYNCOBJ_SIGNAL) ||
+        _IOC_NR(request) == SHIM_IOC_NR(DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL)) {
+        return 0;
+    }
+
+    errno = ENOTTY;
+    return -1;
+}
+
+// ---------------------------------------------------------------------------
+// libdrm API surface
+
+static const char g_driver_name[] = "panfrost";
+
+static drmVersionPtr dup_version(void)
+{
+    drmVersionPtr v = calloc(1, sizeof(*v));
+    if (!v)
+        return NULL;
+    v->version_major = 1;
+    v->version_minor = 5;
+    v->version_patchlevel = 0;
+    v->name = strdup(g_driver_name);
+    v->name_len = (int)strlen(v->name) + 1;
+    v->date = strdup("20260101");
+    v->date_len = 9;
+    v->desc = strdup("NativeMali pseudo-driver");
+    v->desc_len = (int)strlen(v->desc) + 1;
+    return v;
+}
+
+drmVersionPtr drmGetVersion(int fd)
+{
+    if (!conn_of_fd(fd)) {
+        drmVersionPtr (*real)(int) = (drmVersionPtr (*)(int))real_symbol("drmGetVersion");
+        return real ? real(fd) : NULL;
+    }
+    return dup_version();
+}
+
+void drmFreeVersion(drmVersionPtr v)
+{
+    if (!v)
+        return;
+    free(v->name);
+    free(v->date);
+    free(v->desc);
+    free(v);
+}
+
+static drmDevicePtr make_device(void)
+{
+    drmDevicePtr d = calloc(1, sizeof(*d));
+    if (!d)
+        return NULL;
+    d->nodes = calloc(DRM_NODE_MAX, sizeof(char *));
+    if (!d->nodes) {
+        free(d);
+        return NULL;
+    }
+    d->nodes[DRM_NODE_RENDER] = strdup(MALI_DEVICE_PATH);
+    d->available_nodes = 1 << DRM_NODE_RENDER;
+    d->bustype = DRM_BUS_PLATFORM;
+    d->businfo.platform = calloc(1, sizeof(*d->businfo.platform));
+    if (d->businfo.platform)
+        strncpy(d->businfo.platform->fullname, "native-mali",
+                sizeof(d->businfo.platform->fullname) - 1);
+    return d;
+}
+
+void drmFreeDevice(drmDevicePtr *dev)
+{
+    if (!dev || !*dev)
+        return;
+    drmDevicePtr d = *dev;
+    if (d->nodes) {
+        for (int i = 0; i < DRM_NODE_MAX; i++)
+            free(d->nodes[i]);
+        free(d->nodes);
+    }
+    free(d->businfo.platform);
+    free(d);
+    *dev = NULL;
+}
+
+void drmFreeDevices(drmDevicePtr devices[], int count)
+{
+    if (!devices)
+        return;
+    for (int i = 0; i < count; i++)
+        drmFreeDevice(&devices[i]);
+}
+
+int drmGetDevices2(uint32_t flags, drmDevicePtr devices[], int max_devices)
+{
+    (void)flags;
+    if (max_devices < 1)
+        return 0;
+    drmDevicePtr d = make_device();
+    if (!d)
+        return -ENOMEM;
+    if (devices)
+        devices[0] = d;
+    return 1;
+}
+
+int drmGetDevice2(int fd, uint32_t flags, drmDevicePtr *device)
+{
+    (void)flags;
+    if (!device)
+        return -EINVAL;
+    if (!conn_of_fd(fd))
+        return -ENOENT;
+    *device = make_device();
+    return *device ? 0 : -ENOMEM;
+}
+
+int drmGetCap(int fd, uint64_t capability, uint64_t *value)
+{
+    if (!conn_of_fd(fd)) {
+        int (*real)(int, uint64_t, uint64_t *) =
+            (int (*)(int, uint64_t, uint64_t *))real_symbol("drmGetCap");
+        return real ? real(fd, capability, value) : -ENOENT;
+    }
+    if (!value)
+        return -EINVAL;
+    switch (capability) {
+    case DRM_CAP_SYNCOBJ:
+    case DRM_CAP_SYNCOBJ_TIMELINE:
+        *value = 1;
+        return 0;
+    default:
+        return -EINVAL;
+    }
+}
+
+int drmCloseBufferHandle(int fd, uint32_t handle)
+{
+    struct mali_conn *c = conn_of_fd(fd);
+    if (!c)
+        return -EBADF;
+    struct mali_bo *synth = synth_of(handle);
+    if (synth) {
+        memset(synth, 0, sizeof(*synth));
+        return 0;
+    }
+    mali_bo_free(c, handle);
+    return 0;
+}
+
+int drmSyncobjCreate(int fd, uint32_t flags, uint32_t *handle)
+{
+    if (!conn_of_fd(fd) || !handle)
+        return -EBADF;
+    uint32_t h = syncobj_alloc((flags & DRM_SYNCOBJ_CREATE_SIGNALED) != 0);
+    if (!h)
+        return -ENOMEM;
+    *handle = h;
+    return 0;
+}
+
+int drmSyncobjDestroy(int fd, uint32_t handle)
+{
+    (void)fd;
+    struct mali_syncobj *s = syncobj_of(handle);
+    if (s)
+        memset(s, 0, sizeof(*s));
+    return 0;
+}
+
+int drmSyncobjWait(int fd, uint32_t *handles, unsigned count,
+    int64_t timeout_nsec, unsigned flags, uint32_t *first_signaled)
+{
+    (void)fd;
+    (void)flags;
+    if (!handles || !count)
+        return -EINVAL;
+    for (unsigned i = 0; i < count; i++) {
+        struct mali_syncobj *s = syncobj_of(handles[i]);
+        if (!s)
+            return -EINVAL;
+        if (s->signaled) {
+            if (first_signaled)
+                *first_signaled = handles[i];
+            return 0;
+        }
+    }
+    int r = syncobj_wait_one(syncobj_of(handles[0]), 0, timeout_nsec);
+    if (r == 0 && first_signaled)
+        *first_signaled = handles[0];
+    return r;
+}
+
+int drmSyncobjTimelineWait(int fd, uint32_t *handles,
+    uint64_t *points, unsigned count, int64_t timeout_nsec,
+    unsigned flags, uint32_t *first_signaled)
+{
+    (void)fd;
+    (void)timeout_nsec;
+    (void)flags;
+    if (!handles || !points || !count)
+        return -EINVAL;
+    for (unsigned i = 0; i < count; i++) {
+        struct mali_syncobj *s = syncobj_of(handles[i]);
+        if (s && s->signaled && s->point >= points[i]) {
+            if (first_signaled)
+                *first_signaled = handles[i];
+            return 0;
+        }
+    }
+    return -ETIMEDOUT;
+}
+
+int drmSyncobjReset(int fd, const uint32_t *handles, uint32_t count)
+{
+    (void)fd;
+    for (uint32_t i = 0; i < count; i++) {
+        struct mali_syncobj *s = syncobj_of(handles[i]);
+        if (s) {
+            s->signaled = false;
+            s->point = 0;
+        }
+    }
+    return 0;
+}
+
+int drmSyncobjSignal(int fd, const uint32_t *handles, uint32_t count)
+{
+    (void)fd;
+    for (uint32_t i = 0; i < count; i++) {
+        struct mali_syncobj *s = syncobj_of(handles[i]);
+        if (s) {
+            s->signaled = true;
+            s->point += 1;
+        }
+    }
+    return 0;
+}
+
+int drmSyncobjTimelineSignal(int fd, const uint32_t *handles,
+    uint64_t *points, uint32_t count)
+{
+    (void)fd;
+    for (uint32_t i = 0; i < count; i++) {
+        struct mali_syncobj *s = syncobj_of(handles[i]);
+        if (s && points[i] > s->point) {
+            s->point = points[i];
+            s->signaled = true;
+        }
+    }
+    return 0;
+}
+
+int drmSyncobjTransfer(int fd, uint32_t dst_handle, uint64_t dst_point,
+    uint32_t src_handle, uint64_t src_point, uint32_t flags)
+{
+    (void)fd;
+    (void)flags;
+    struct mali_syncobj *dst = syncobj_of(dst_handle);
+    struct mali_syncobj *src = syncobj_of(src_handle);
+    if (!dst || !src)
+        return -EINVAL;
+    dst->point = dst_point ? dst_point : src->point;
+    dst->signaled = src->signaled;
+    (void)src_point;
+    return 0;
+}
+
+int drmSyncobjHandleToFD(int fd, uint32_t handle, int *obj_fd)
+{
+    (void)fd;
+    (void)handle;
+    (void)obj_fd;
+    return -ENOSYS;
+}
+
+int drmSyncobjFDToHandle(int fd, int obj_fd, uint32_t *handle)
+{
+    (void)fd;
+    (void)obj_fd;
+    (void)handle;
+    return -ENOSYS;
+}
+
+int drmSyncobjExportSyncFile(int fd, uint32_t handle, int *sync_file_fd)
+{
+    (void)fd;
+    (void)handle;
+    (void)sync_file_fd;
+    return -ENOSYS;
+}
+
+int drmSyncobjImportSyncFile(int fd, uint32_t handle, int sync_file_fd)
+{
+    (void)fd;
+    (void)handle;
+    (void)sync_file_fd;
+    return -ENOSYS;
+}
+
+int drmSyncobjQuery(int fd, uint32_t *handles, uint64_t *points,
+    uint32_t count)
+{
+    (void)fd;
+    for (uint32_t i = 0; i < count; i++) {
+        struct mali_syncobj *s = syncobj_of(handles[i]);
+        points[i] = s ? s->point : 0;
+    }
+    return 0;
+}
+
+int drmSyncobjQuery2(int fd, uint32_t *handles, uint64_t *points,
+    uint32_t count, uint32_t flags)
+{
+    (void)flags;
+    return drmSyncobjQuery(fd, handles, points, count);
+}
+
+// ---------------------------------------------------------------------------
+// libc interposition: render node open/stat and BO mmap
+
+int open(const char *path, int flags, ...)
+{
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+    }
+    if (path && strncmp(path, "/dev/dri/", 9) == 0)
+        return mali_open_device();
+    int (*real)(const char *, int, ...) =
+        (int (*)(const char *, int, ...))real_symbol("open");
+    if (!real) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return real(path, flags, mode);
+}
+
+int native_stat(const char *path, struct stat *sb) __asm("_stat$INODE64");
+int native_stat(const char *path, struct stat *sb)
+{
+    if (path && strncmp(path, "/dev/dri/", 9) == 0) {
+        memset(sb, 0, sizeof(*sb));
+        sb->st_mode = S_IFCHR | 0666;
+        sb->st_rdev = (dev_t)(0x0100 | (path[9] ? path[9] : '0'));
+        return 0;
+    }
+    int (*real)(const char *, struct stat *) =
+        (int (*)(const char *, struct stat *))real_symbol("stat");
+    if (!real) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return real(path, sb);
+}
+
+void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset)
+{
+    struct mali_conn *c = conn_of_fd(fd);
+    if (c) {
+        struct mali_bo *bo = bo_by_offset((uint64_t)offset);
+        if (!bo) {
+            errno = EINVAL;
+            return MAP_FAILED;
+        }
+        if (bo->map && bo->map != MAP_FAILED)
+            return bo->map;
+        mach_vm_address_t any = 0;
+        mach_vm_size_t mapLen = len;
+        kern_return_t kr = IOConnectMapMemory64(c->conn,
+            mali_abi_mmap_type(bo->handle), mach_task_self(), &any,
+            &mapLen, kIOMapAnywhere);
+        if (kr != KERN_SUCCESS) {
+            errno = ENOMEM;
+            return MAP_FAILED;
+        }
+        bo->map = (void *)(uintptr_t)any;
+        (void)addr;
+        (void)prot;
+        (void)flags;
+        return bo->map;
+    }
+    void *(*real)(void *, size_t, int, int, int, off_t) =
+        (void *(*)(void *, size_t, int, int, int, off_t))real_symbol("mmap");
+    if (!real) {
+        errno = ENOSYS;
+        return MAP_FAILED;
+    }
+    return real(addr, len, prot, flags, fd, offset);
+}
+
+int close(int fd)
+{
+    struct mali_conn *c = conn_of_fd(fd);
+    if (c) {
+        IOServiceClose(c->conn);
+        memset(c, 0, sizeof(*c));
+        return 0;
+    }
+    int (*real)(int) = (int (*)(int))real_symbol("close");
+    if (!real) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return real(fd);
+}

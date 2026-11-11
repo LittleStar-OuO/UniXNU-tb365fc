@@ -95,8 +95,8 @@ static IOReturn hostSubmit (uint32_t direction, uint32_t dataBytes, uint32_t tim
     d112Submits++;
     kprintf ("d112 hs%u pre db=%x is=%x t=%llx\n", d112Submits,
         read32 (gHost.hc, 0x58), read32 (gHost.hc, 0x20), mach_absolute_time ());
-  } else if (!quiet && (++d114Submits & 4095) == 0) {
-    // diag114: silent submits hid where the root I/O loop went. Every 4096th one
+  } else if (!quiet && (++d114Submits & 262143) == 0) {
+    // diag114: silent submits hid where the root I/O loop went. Every 262144th one
     // names opcode, LUN, direction, bytes and LBA (READ/WRITE 10/16). The userland
     // boot issues thousands of 4 KiB reads per minute, so a 256 rate floods the
     // console and slows the polling path that must still meet its deadline.
@@ -305,6 +305,122 @@ static IOReturn hostUicCommand (uint32_t opcode, uint32_t arg1, uint32_t arg3, u
   if (result) *result = code;
   if (value) *value = got;
   return status;
+}
+
+// UniPro PA attributes (Linux include/ufs/unipro.h) and the power mode change of
+// ufshcd_get_max_pwr_mode/ufshcd_change_power_mode. The link starts at PWM after
+// LINKSTARTUP; FAST mode needs the attribute set and one UIC PWRMODE command.
+enum : uint32_t {
+  kPaActiveTxDataLanes = 0x1560, kPaConnectedTxDataLanes = 0x1561,
+  kPaTxGear = 0x1568, kPaTxTermination = 0x1569, kPaHsSeries = 0x156A,
+  kPaPwrMode = 0x1571,
+  kPaActiveRxDataLanes = 0x1580, kPaConnectedRxDataLanes = 0x1581,
+  kPaRxGear = 0x1583, kPaRxTermination = 0x1584,
+  kPaMaxRxPwmGear = 0x1586, kPaMaxRxHsGear = 0x1587,
+  kPaTxHsAdaptType = 0x15D4,
+};
+enum : uint32_t { kUicDmeGet = 0x01, kUicDmeSet = 0x02, kUicDmePeerGet = 0x03 };
+enum : uint32_t { kUfsFastMode = 1, kUfsHsModeB = 2, kUfsHsNoAdapt = 3 };
+
+static bool ufsDmeGet (uint32_t mib, uint32_t *value, bool peer = false)
+{
+  uint32_t code = 0, got = 0;
+  IOReturn status = hostUicCommand (peer ? kUicDmePeerGet : kUicDmeGet, mib << 16, 0, 2000000, &code, &got);
+  if (status != kIOReturnSuccess) return false;
+  if (value) *value = got;
+  return true;
+}
+
+static bool ufsDmeSet (uint32_t mib, uint32_t value)
+{
+  uint32_t code = 0, got = 0;
+  return hostUicCommand (kUicDmeSet, mib << 16, value, 2000000, &code, &got) == kIOReturnSuccess;
+}
+
+// Logging variant: name the attribute and the UIC result on failure.
+static bool ufsDmeSetT (uint32_t mib, uint32_t value)
+{
+  uint32_t code = 0, got = 0;
+  IOReturn status = hostUicCommand (kUicDmeSet, mib << 16, value, 2000000, &code, &got);
+  if (status != kIOReturnSuccess) {
+    kprintf ("d191 hs set %x v=%x s=%x c=%x\n", mib, value, static_cast<uint32_t> (status), code);
+  }
+  return status == kIOReturnSuccess;
+}
+
+static uint32_t ufsPowerMode (void)
+{
+  uint32_t now = 0;
+  (void) ufsDmeGet (kPaPwrMode, &now);
+  return now;
+}
+
+// Switch the link to HS FAST. Reports through d191. A failure leaves the link in
+// its previous state; callers keep bringing up at whatever speed the link runs.
+static bool hostEnableHsGear (void)
+{
+  uint32_t localMax = 0, peerMax = 0, lanesRx = 0, lanesTx = 0;
+  // Each stage holds the console long enough for the 5 s frame capture: this
+  // block failed during the one boot that reached it and scrolled away before.
+  kprintf ("d191 hs enter\n");
+  IOSleep (1500);
+  if (!ufsDmeGet (kPaMaxRxHsGear, &localMax) || !localMax) {
+    kprintf ("d191 hs no local max v=%x\n", localMax);
+    IOSleep (1500);
+    return false;
+  }
+  if (!ufsDmeGet (kPaMaxRxHsGear, &peerMax, true) || !peerMax) {
+    peerMax = localMax;
+  }
+  uint32_t gear = localMax < peerMax ? localMax : peerMax;
+  (void) ufsDmeGet (kPaConnectedRxDataLanes, &lanesRx);
+  (void) ufsDmeGet (kPaConnectedTxDataLanes, &lanesTx);
+  if (!lanesRx || lanesRx > 2) lanesRx = 1;
+  if (!lanesTx || lanesTx > 2) lanesTx = 1;
+  kprintf ("d191 hs in l=%u p=%u ln=%u/%u\n", localMax, peerMax, lanesRx, lanesTx);
+  IOSleep (1500);
+  bool setOk = true;
+  setOk &= ufsDmeSetT (kPaRxGear, gear);
+  setOk &= ufsDmeSetT (kPaActiveRxDataLanes, lanesRx);
+  setOk &= ufsDmeSetT (kPaRxTermination, 1);
+  setOk &= ufsDmeSetT (kPaTxGear, gear);
+  setOk &= ufsDmeSetT (kPaActiveTxDataLanes, lanesTx);
+  setOk &= ufsDmeSetT (kPaTxTermination, 1);
+  setOk &= ufsDmeSetT (kPaHsSeries, kUfsHsModeB);
+  // Optional TX adapt control: diag194's ring replay showed this device answers
+  // the attribute with UIC result code 1 (unsupported), so its refusal must not
+  // cancel the power-mode change.
+  if (!ufsDmeSetT (kPaTxHsAdaptType, kUfsHsNoAdapt)) {
+    kprintf ("d191 hs adapt skip\n");
+  }
+  if (!setOk) {
+    kprintf ("d191 hs attr failed pm=%x\n", ufsPowerMode ());
+    IOSleep (1500);
+    return false;
+  }
+  // FAST first; some MTK hosts accept only the FASTAUTO request on this link.
+  static const uint32_t modes[] = { kUfsFastMode, 4 /* FASTAUTO */ };
+  for (uint32_t mode : modes) {
+    if (!ufsDmeSet (kPaPwrMode, (mode << 4) | mode)) {
+      kprintf ("d191 hs pm set failed m=%x\n", mode);
+      IOSleep (1200);
+      continue;
+    }
+    kprintf ("d191 hs pm set m=%x\n", (mode << 4) | mode);
+    IOSleep (1200);
+    IODelay (2000);
+    uint32_t now = ufsPowerMode ();
+    if (now == ((mode << 4) | mode)) {
+      kprintf ("d191 hs gear=%u ln=%u/%u m=%x ok=1\n", gear, lanesRx, lanesTx, now);
+      IOSleep (5000);
+      return true;
+    }
+    kprintf ("d191 hs mode=%x now=%x\n", mode, now);
+    IOSleep (1200);
+  }
+  kprintf ("d191 hs pmc failed pm=%x\n", ufsPowerMode ());
+  IOSleep (1500);
+  return false;
 }
 
 // The handoff leaves HCS.UPMCRS=PWR_LOCAL (LK's power-off notify stopped inside a power mode change) and a failed

@@ -290,14 +290,93 @@ cmd += ['-Wall', '-Wextra', '-Wno-unused-parameter', '-Wno-missing-designated-fi
         '-Wno-c99-designator', '-Wno-reorder-init-list', '-Wno-deprecated-enum-enum-conversion',
         '-I', str(ROOT / '.cache/xnu-work/osfmk')]
 run(cmd, cwd=record['directory'])
+def compile_probe(name):
+    src = ROOT / ('kits/tb365fc/' + name)
+    require(src.exists(), 'Missing kits/tb365fc/' + name)
+    c = []
+    j = 0
+    while j < len(args):
+        v = args[j]
+        if v == record['file']:
+            c.append(str(src))
+        elif v == '-o':
+            c += ['-o', str(OUT / (name[:-4] + '.o'))]
+            j += 1
+        elif v == '-Xclang' and args[j + 1].startswith('-W'):
+            j += 1
+        elif not v.startswith('-W'):
+            c.append(v)
+        j += 1
+    c += ['-Wall', '-Wextra', '-Wno-unused-parameter', '-Wno-missing-designated-field-initializers',
+          '-Wno-unnecessary-virtual-specifier', '-Wno-c99-designator', '-Wno-reorder-init-list',
+          '-Wno-deprecated-enum-enum-conversion', '-I', str(ROOT / '.cache/xnu-work/osfmk')]
+    run(c, cwd=record['directory'])
+    return OUT / (name[:-4] + '.o')
+hid_probe_obj = compile_probe('HidInputProbe.cpp')
+keystore_probe_obj = compile_probe('KeyStoreProbe.cpp')
+mali_source = ROOT / 'kits/tb365fc/NativeMali.cpp'
+require(mali_source.exists(), 'Missing kits/tb365fc/NativeMali.cpp')
+cmd = []
+i = 0
+while i < len(args):
+    value = args[i]
+    if value == record['file']:
+        cmd.append(str(mali_source))
+    elif value == '-o':
+        cmd += ['-o', str(OUT / 'NativeMali.o')]
+        i += 1
+    elif value == '-Xclang' and args[i + 1].startswith('-W'):
+        i += 1
+    elif not value.startswith('-W'):
+        cmd.append(value)
+    i += 1
+cmd += ['-Wall', '-Wextra', '-Wno-unused-parameter', '-Wno-missing-designated-field-initializers',
+        '-Wno-c99-designator', '-Wno-reorder-init-list', '-Wno-deprecated-enum-enum-conversion',
+        '-I', str(ROOT / '.cache/xnu-work/osfmk')]
+run(cmd, cwd=record['directory'])
+# The launch hook uses BSD syscall types, so reuse the kernel's C recipe.
+launch_source = ROOT / 'kits/tb365fc/TB365FCProbeLaunch.c'
+require(launch_source.exists(), 'Missing kits/tb365fc/TB365FCProbeLaunch.c')
+launch_recipe = ROOT / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT/kern_exec.o.json'
+launch_record = json.loads(launch_recipe.read_text().strip().rstrip(','))
+cmd = []
+launch_args = launch_record['arguments']
+i = 0
+while i < len(launch_args):
+    value = launch_args[i]
+    if value == launch_record['file']:
+        cmd.append(str(launch_source))
+    elif value == '-o':
+        cmd += ['-o', str(OUT / 'TB365FCProbeLaunch.o')]
+        i += 1
+    elif value in ('-MF', '-MT', '-MQ', '-MJ'):
+        i += 1
+    else:
+        cmd.append(value)
+    i += 1
+run(cmd, cwd=launch_record['directory'])
+
+mali_late = OUT / 'NativeMali.late.o'
+late_stage(OUT / 'NativeMali.o', mali_late, '__GLOBAL__sub_I_NativeMali.cpp')
+# Original IOAcceleratorES class members are not exported; bind the audited
+# tb365fc addresses discovered by the vtable/getMetaClass audit.
+mali_bindings = OUT / 'mali-accelerator-bindings.S'
+mali_bindings.write_text('''
+.globl __ZN15IOAcceleratorESC2EPK11OSMetaClass
+.set __ZN15IOAcceleratorESC2EPK11OSMetaClass, 0xfffffff004bd3b20
+.globl __ZN15IOAcceleratorESD2Ev
+.set __ZN15IOAcceleratorESD2Ev, 0xfffffff004bd3b64
+.globl __ZN15IOAcceleratorES10gMetaClassE
+.set __ZN15IOAcceleratorES10gMetaClassE, 0xfffffff006aeb688
+''')
+run([clang, '-target', 'arm64-apple-ios17.0', '-c', str(mali_bindings),
+     '-o', str(OUT / 'mali-accelerator-bindings.o')])
 stub = OUT / 'tb365fc-display-stubs.c'
 stub.write_text('''/* Providers that the QEMU board links and TB365FC does not have: the
    QEMU display probes, a panel vsync source, the MTK DPU scanout hooks, and
    the BootProgress framebuffer claim. They are real definitions so the kernel
    links; an unclaimed framebuffer and DPU state zero keep NativeLegacyDisplay
    on the CPU/GOP present path. */
-void native_keystore_probe(void) {}
-void native_hid_input_probe(void) {}
 void native_virtio_input_probe(void) {}
 void native_shared_window_probe(void) {}
 void native_qemu_metal_publish(void) {}
@@ -309,12 +388,23 @@ _Bool native_legacy_set_refresh_properties(void *display) { (void)display; retur
 unsigned native_ufs_dpu_map(unsigned slot, const unsigned long long *pages, unsigned count)
 { (void)slot; (void)pages; (void)count; return 0; }
 volatile unsigned native_ufs_dpu_state = 0;
+/* Diagnostic markers the ArmCpu and ShengUfs probes reference; the
+   boot board defines them nowhere and QEMU links them from its kits. */
+volatile unsigned armcpu_marker_a, armcpu_marker_b, armcpu_marker_c, armcpu_marker_d;
+void d117_mark(unsigned slot) { (void)slot; }
 int boot_progress_prepare_scanout(void) { return 1; }
 void boot_progress_cancel_scanout(void) {}
 void boot_progress_stage(const char *message) { (void)message; }
 int boot_progress_pulse_anchor(unsigned long anchor, unsigned long long length,
                                unsigned width, unsigned height, unsigned stride)
 { (void)anchor; (void)length; (void)width; (void)height; (void)stride; return 0; }
+/* The sheng touch core (ShengNovatekTouch + QcomGeniSpi) and the button
+   driver are not part of this MTK board's stack yet; the offline HID source
+   only needs their sink hooks and published counters. */
+volatile unsigned native_touch_seq, native_touch_count, native_touch_hid_reports;
+volatile int native_touch_xs[12], native_touch_ys[12], native_touch_ids[12];
+void native_touch_set_sink(void (*sink)(void *), void *context) { (void)sink; (void)context; }
+void native_buttons_set_sink(void (*sink)(void *, unsigned int), void *context) { (void)sink; (void)context; }
 ''')
 run([clang, '-target', 'arm64-apple-ios17.0', '-c', '-O2', '-ffreestanding', str(stub),
      '-o', str(OUT / 'tb365fc-display-stubs.o')])
@@ -325,14 +415,33 @@ late_stage(gop / 'NativeGOPPresenter.o', gop_late, '__GLOBAL__sub_I_NativeGOPPre
 require(code((gop / 'NativeGOPPresenter.o').read_bytes(), macho((gop / 'NativeGOPPresenter.o').read_bytes())) ==
         code(gop_late.read_bytes(), macho(gop_late.read_bytes())),
         'Owned presenter instructions unchanged by late init staging')
+# Official sheng input/key components: the HID device class and the key store
+# state service come from their component scripts, staged late (their static
+# initializers run from the probe after IOHIDFamily/AppleKeyStore are present).
+print(run(['python3', ROOT / 'scripts/build-sheng-hid-input.py'], text=True), end='')
+print(run(['python3', ROOT / 'scripts/build-arm-driver.py', 'AppleKeyStoreState'], text=True), end='')
+hid_dir = ROOT / 'build/sheng-hid-input'
+keyevents_dir = ROOT / 'build/apple-key-store-state'
+keyevents_late = keyevents_dir / 'NativeKeyStoreEvents.late.o'
+late_stage(keyevents_dir / 'NativeKeyStoreEvents.o', keyevents_late, '__GLOBAL__sub_I_NativeKeyStoreEvents.cpp')
+require(code((keyevents_dir / 'NativeKeyStoreEvents.o').read_bytes(), macho((keyevents_dir / 'NativeKeyStoreEvents.o').read_bytes())) ==
+        code(keyevents_late.read_bytes(), macho(keyevents_late.read_bytes())),
+        'Owned event-service instructions unchanged by late init staging')
 archive = OUT / 'libNativeLegacyDisplay.late.a'
 archive.unlink(missing_ok=True)
 run([llvm_ar, 'rcs', archive, late, OUT / 'original-bindings.o', OUT / 'LegacyDisplayProbe.o',
-     OUT / 'BootLog.o', OUT / 'tb365fc-display-stubs.o', gop_late])
+     OUT / 'BootLog.o', mali_late, OUT / 'mali-accelerator-bindings.o',
+     OUT / 'tb365fc-display-stubs.o', OUT / 'TB365FCProbeLaunch.o', gop_late,
+     OUT / 'HidInputProbe.o', OUT / 'KeyStoreProbe.o',
+     hid_dir / 'NativeHidInput.late.o', hid_dir / 'hid-original-bindings.o', keyevents_late])
 report_sources = ['drivers/GopFramebuffer/NativeLegacyDisplay.cpp',
                   'drivers/GopFramebuffer/NativeGOPPresenter.cpp',
                   'kits/tb365fc/LegacyDisplayProbe.cpp',
-                  'kits/tb365fc/BootLog.cpp']
+                  'kits/tb365fc/BootLog.cpp',
+                  'kits/tb365fc/NativeMali.cpp',
+                  'kits/tb365fc/HidInputProbe.cpp',
+                  'kits/tb365fc/KeyStoreProbe.cpp',
+                  'kits/tb365fc/TB365FCProbeLaunch.c']
 (OUT / 'build-report.json').write_text(json.dumps(dict(
     source_sha256={name: sha(ROOT / name) for name in report_sources},
     generated_abi_sha256=sha(OUT / 'OriginalLegacyFramebufferABI.h'),
@@ -341,6 +450,6 @@ report_sources = ['drivers/GopFramebuffer/NativeLegacyDisplay.cpp',
     compiled_object_sha256=sha(obj), late_object_sha256=sha(late), archive_sha256=sha(archive),
     bindings={n: hex(v) for n, v in bindings.items()}, virtual_entries=358, owned_entries=owned,
     inherited_native_entries=native, guarded_backend_leaves=[i for i in pure if i not in (213, 337)],
-    keystore_probe='stub', hid_probe='stub', original_instructions_modified=False,
+    keystore_probe='linked', hid_probe='linked', original_instructions_modified=False,
     driver_initialized=False, display_presented=False), indent=2) + '\n')
-print('Built minimal TB365FC legacy display archive; key/HID probes stubbed')
+print('Built TB365FC legacy display archive; key/HID probes linked')

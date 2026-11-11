@@ -1,0 +1,42 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7091,8 +7091,8 @@
+ #if !defined(XNU_OWNER_UNION_SYSTEMOS) || !XNU_OWNER_UNION_SYSTEMOS
+ #if defined(XNU_OWNER_CRYPTEX_FILES) && XNU_OWNER_CRYPTEX_FILES
+ 	const char *fallback = "DYLD_FALLBACK_LIBRARY_PATH=/private/preboot/usr/lib";
+-	user64_addr_t environment_vector[3] = {scratch + 0x400, scratch + 0x600, USER_ADDR_NULL};
++	user64_addr_t environment_vector[3] = {scratch + 0xd00, scratch + 0xf00, USER_ADDR_NULL};
+ #else
+-	user64_addr_t environment_vector[2] = {scratch + 0x400, USER_ADDR_NULL};
++	user64_addr_t environment_vector[2] = {scratch + 0xd00, USER_ADDR_NULL};
+ #endif
+ #endif
+@@ -7151,11 +7151,12 @@
+ 	native_owner_cache_stage = 5;
++	/* Later addon mounts use 0x400..0x9ff; mkdir uses 0xc00..0xcbf. */
+ #if !defined(XNU_OWNER_UNION_SYSTEMOS) || !XNU_OWNER_UNION_SYSTEMOS
+ 	if ((error = copyout(environment, environment_vector[0], strlen(environment) + 1)) != 0 ||
+-	    (error = copyout(environment_vector, scratch + 0x500, sizeof(environment_vector))) != 0) goto done;
++	    (error = copyout(environment_vector, scratch + 0xe00, sizeof(environment_vector))) != 0) goto done;
+ #if defined(XNU_OWNER_CRYPTEX_FILES) && XNU_OWNER_CRYPTEX_FILES
+-	if ((error = copyout(fallback, scratch + 0x600, strlen(fallback) + 1)) != 0) goto done;
++	if ((error = copyout(fallback, scratch + 0xf00, strlen(fallback) + 1)) != 0) goto done;
+ #endif
+-	*envp = scratch + 0x500;
++	*envp = scratch + 0xe00;
+ #else
+ 	*envp = USER_ADDR_NULL;
+ #endif
+@@ -7757,7 +7758,12 @@
+ #if defined(XNU_OWNER_DATA_MOUNT) && XNU_OWNER_DATA_MOUNT
+ 	int data_error = native_owner_data_prepare(p, (user_addr_t)scratch_addr);
+ 	if (data_error) panic("offline scratch Data mount failed: %d", data_error);
+ #endif
++#if defined(XNU_OWNER_DATA_MOUNT) && XNU_OWNER_DATA_MOUNT
++	extern int tb365fc_mali_probe_spawn(void *, uint64_t, uint64_t);
++	set_security_token(p, proc_ucred_unsafe(p));
++	(void)tb365fc_mali_probe_spawn(p, (uint64_t)scratch_addr, (uint64_t)init_envp);
++#endif
+ 	{
+ 		thread_t watcher = NULL;
+ 		if (kernel_thread_start(native_stall_watchdog, NULL, &watcher) == KERN_SUCCESS) {

@@ -20,6 +20,7 @@ extern "C" kmod_info_t g_kernel_kmod_info;
 extern "C" void native_legacy_display_static_init(void) __asm__("__GLOBAL__sub_I_NativeLegacyDisplay.cpp");
 extern "C" IOService *native_legacy_display_allocate(void);
 extern "C" void native_gop_presenter_static_init(void) __asm__("__GLOBAL__sub_I_NativeGOPPresenter.cpp");
+extern "C" void native_mali_static_init(void) __asm__("__GLOBAL__sub_I_NativeMali.cpp");
 extern "C" IOService *native_gop_presenter_create(void);
 static IOService *pendingLegacyDisplay;
 static IOService *activeGOPPresenter,*activeGOPNub;
@@ -450,7 +451,7 @@ void native_legacy_display_probe(void) {
     if(native_legacy_stage)return;
     native_legacy_stage=1;void *handle=OSMetaClass::preModLoad(g_kernel_kmod_info.name);
     if(!handle){native_legacy_display_checkpoint();return;}
-    native_legacy_display_static_init();native_gop_presenter_static_init();native_legacy_meta_status=OSMetaClass::postModLoad(handle);
+    native_legacy_display_static_init();native_gop_presenter_static_init();native_mali_static_init();native_legacy_meta_status=OSMetaClass::postModLoad(handle);
     if(native_legacy_meta_status){native_legacy_display_checkpoint();return;}
     PE_Video video={};native_legacy_stage=2;
     if(PE_current_console(&video) || !video.v_baseAddr || !video.v_width || !video.v_height || video.v_depth!=32

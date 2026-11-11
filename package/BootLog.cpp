@@ -13,7 +13,7 @@ extern "C" int native_ufs_log_write(uint64_t rel, uint32_t blocks, const void *s
 extern "C" int native_ufs_log_sync(void) __attribute__((weak_import));
 
 static const uint32_t kBlock = 4096;
-static const uint32_t kMsgBlocks = 16;                 // 64 KiB of console text
+static const uint32_t kMsgBlocks = 128;                // 512 KiB of console text
 static const uint32_t kMsgBytes = kMsgBlocks * kBlock;
 
 static char gRing[kMsgBytes];
@@ -33,6 +33,10 @@ struct boot_log_header {
     char tag[32];
 };
 static_assert(sizeof(boot_log_header) == 120, "reader header layout");
+
+// Owned key store probe publishes its AKS counter rows here; layout shared
+// with UniXNU-sheng's BootProgress.c (slots 0-1 are the AKS rows).
+extern "C" char boot_progress_ext[8][48] = {};
 
 extern "C" void native_boot_log_vput(const char *fmt, va_list ap)
 {
@@ -105,7 +109,8 @@ static void boot_log_thread(void *, wait_result_t)
     uint64_t first = 0, blocks = 0;
     const char *why = "";
     bool opened = false;
-    for (int i = 0; i < 240; i++) {
+    int tries = 0;
+    for (; tries < 240; tries++) {
         if (native_ufs_log_open && native_ufs_log_open(&first, &blocks, &why)) {
             opened = true;
             break;
@@ -113,15 +118,30 @@ static void boot_log_thread(void *, wait_result_t)
         IOSleep(500);
     }
     if (!opened || blocks == 0) {
+        kprintf("blg fail why=%s tries=%d\n", why ? why : "?", tries);
+        IOSleep(4000);
         return;
     }
+    kprintf("blg open first=%llx n=%llx\n", first, blocks);
+    IOSleep(2000);
     gFirstLba = first;
     gWindowBlocks = (uint32_t)blocks;
     gBootId = mach_absolute_time();
     for (;;) {
         IOSleep(10 * 1000);
         boot_log_snapshot();
+        if ((gRounds % 6) == 0) {
+            kprintf("blg snap r=%u e=%u u=%u\n", gRounds, gErrors, gRingUsed);
+        }
     }
+}
+
+extern "C" void native_boot_log_flush(void)
+{
+    if (gWindowBlocks == 0) {
+        return;
+    }
+    boot_log_snapshot();
 }
 
 extern "C" void native_boot_log_start(void)
@@ -131,6 +151,7 @@ extern "C" void native_boot_log_start(void)
         return;
     }
     if (!native_ufs_log_open || !native_ufs_log_write) {
+        kprintf("blg nosym\n");
         return;
     }
     static bool started;
@@ -139,7 +160,10 @@ extern "C" void native_boot_log_start(void)
     }
     started = true;
     thread_t thread;
-    if (kernel_thread_start(boot_log_thread, nullptr, &thread) == KERN_SUCCESS) {
+    kern_return_t started_rc = kernel_thread_start(boot_log_thread, nullptr, &thread);
+    kprintf("blg start rc=%x\n", started_rc);
+    IOSleep(1000);
+    if (started_rc == KERN_SUCCESS) {
         thread_deallocate(thread);
     }
 }

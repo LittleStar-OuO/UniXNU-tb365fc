@@ -37,6 +37,15 @@ extern const uint8_t verified_root_key[];
 #endif
 // Legacy display client gate: the probe defines this; other boards leave it out.
 extern volatile int native_legacy_client_status __attribute__((weak));
+// Legacy display probe counters, for the periodic lfp heartbeat on the console.
+extern volatile int native_legacy_client_pid __attribute__((weak));
+extern volatile uint32_t native_legacy_prepare_calls __attribute__((weak));
+extern volatile uint32_t native_legacy_prepare_failures __attribute__((weak));
+extern volatile uint32_t native_legacy_retired_generation __attribute__((weak));
+extern volatile uint32_t native_legacy_presented_generation __attribute__((weak));
+extern volatile uint32_t native_legacy_retired_frames __attribute__((weak));
+extern volatile int native_legacy_transfer_status __attribute__((weak));
+extern char native_legacy_client_class[] __attribute__((weak));
 volatile uint32_t native_ufs_probe_calls = 0;
 volatile uint32_t native_ufs_matched = 0;
 volatile uint32_t native_ufs_probe_requested = 0;
@@ -60,6 +69,25 @@ volatile uint32_t native_ufs_policy_status = 0xffffffff;
 volatile uint32_t native_ufs_verified_windows = 0;
 volatile uint64_t native_ufs_verified_blocks = 0;
 volatile uint32_t native_ufs_integrity_failures = 0;
+}
+
+// BootLog lives in the legacy display late archive; boards without it skip the call.
+extern "C" void native_boot_log_start (void) __attribute__((weak_import));
+
+// The legacy display probe records the client and presentation state; this
+// heartbeat brings those counters to the console while the UI does not show.
+static void displayHeartbeatThread (void *, wait_result_t)
+{
+  for (;;) {
+    IOSleep (20000);
+    if (&::native_legacy_client_status == nullptr) continue;
+    kprintf ("lfp c=%d pid=%d pc=%u pf=%u rg=%u pg=%u rf=%u ts=%x cls=%s\n",
+        ::native_legacy_client_status, ::native_legacy_client_pid,
+        ::native_legacy_prepare_calls, ::native_legacy_prepare_failures,
+        ::native_legacy_retired_generation, ::native_legacy_presented_generation,
+        ::native_legacy_retired_frames, static_cast<uint32_t> (::native_legacy_transfer_status),
+        static_cast<const char *> (::native_legacy_client_class) ? ::native_legacy_client_class : "?");
+  }
 }
 
 class NativeUfs : public IOService {
@@ -418,6 +446,12 @@ static bool hostBringUp (const char **why)
     }
     if (turStatus == kIOReturnSuccess) {
       gHost.ready = true;
+      {
+        uint32_t hs = 1;
+        if (!PE_parse_boot_argn ("native-ufs-hs", &hs, sizeof (hs)) || hs) {
+          hostEnableHsGear ();
+        }
+      }
       return true;
     }
     if (gHost.poisoned) break;
@@ -740,6 +774,84 @@ extern "C" int native_ufs_log_write (uint64_t rel, uint32_t blocks, const void *
     blocks -= chunk;
   }
   return 1;
+}
+
+static bool logContains (const char *hay, const char *needle)
+{
+  size_t nl = strlen (needle);
+  for (const char *p = hay; *p; ++p) {
+    if (strncmp (p, needle, nl) == 0) return true;
+  }
+  return false;
+}
+
+// Diagnostic: the BootLog message ring persists in the reserved window until this
+// boot's writer replaces it. Before that first write, scan the previous content
+// for the probe markers and echo only those lines: the large-font console keeps
+// about forty rows, so the output stays bounded.
+static void dumpPreviousLog (uint64_t userdataLast)
+{
+  static const unsigned kMsgBlocksPrev = 128;
+  static char candidates[32][128];
+  static const char *markers[] = {"d191", "d144 bench", "dp /", "dap|", "blg ", "lfp ", "pid=53 ", "IOMobileFramebuffer", "SpringBoard", "plog|", "dexit mali-vk", "dlopen", "vkCreate", "BO CPU", "readback"};
+  const uint64_t first = userdataLast + 1 - kLogReserveBlocks;
+  const size_t total = (size_t) kMsgBlocksPrev * 4096;
+  unsigned found = 0, lines = 0, d112 = 0, d114 = 0, fcntl = 0, plog = 0, dexit = 0, mali = 0;
+  uint8_t *buf = static_cast<uint8_t *> (IOMalloc (total));
+  if (!buf) return;
+  IOReturn prevRead = hostRead4k (kUserdataLun, first + 1, kMsgBlocksPrev, buf);
+  if (prevRead == kIOReturnSuccess) {
+    size_t i = 0;
+    while (i < total && found < 32) {
+      if (buf[i] >= 32 && buf[i] < 127) {
+        size_t j = i;
+        while (j < total && buf[j] >= 32 && buf[j] < 127) j++;
+        if (j - i >= 6) {
+          char line[128];
+          size_t n = j - i;
+          if (n > 120) n = 120;
+          memcpy (line, buf + i, n);
+          line[n] = 0;
+          lines++;
+          if (logContains (line, "d112")) d112++;
+          if (logContains (line, "d114")) d114++;
+          if (logContains (line, "dfcntl")) fcntl++;
+          if (logContains (line, "plog|")) plog++;
+          if (logContains (line, "dexit")) dexit++;
+          if (logContains (line, "mali-vk")) mali++;
+          bool hit = false;
+          for (const char *m : markers) {
+            if (logContains (line, m)) {
+              hit = true;
+              break;
+            }
+          }
+          if (hit) {
+            bool dup = false;
+            for (unsigned k = 0; k < found; ++k) {
+              if (strcmp (candidates[k], line) == 0) {
+                dup = true;
+                break;
+              }
+            }
+            if (!dup) {
+              strlcpy (candidates[found], line, sizeof (candidates[found]));
+              found++;
+            }
+          }
+        }
+        i = j;
+      } else {
+        i++;
+      }
+    }
+  }
+  IOFree (buf, total);
+  kprintf ("prev| lines=%u d112=%u d114=%u fcntl=%u plog=%u dexit=%u mali=%u rd=%x\n",
+      lines, d112, d114, fcntl, plog, dexit, mali, static_cast<uint32_t> (prevRead));
+  for (unsigned k = 0; k < found; ++k) {
+    kprintf ("prev| %s\n", candidates[k]);
+  }
 }
 
 // The export region below the log window: its size in blocks once the log is open, else 0; writes at a block offset inside it.
@@ -1364,6 +1476,7 @@ bool NativeUfs::startRoot (IOService *provider)
     if (layout) IOFree (layout, sizeof (RootLayout));
     return false;
   }
+  dumpPreviousLog (layout->userdataLast);
   kprintf ("d114 layout w=%u first=%llx last=%llx img=%llx ms=%u t=%llx\n",
       layout->windows, layout->userdataFirst, layout->userdataLast, layout->imageBytes,
       layout->manifestStatus, mach_absolute_time ());
@@ -1371,10 +1484,10 @@ bool NativeUfs::startRoot (IOService *provider)
     uint64_t benchLba = layout->userdataFirst + layout->window[0].offset / 4096;
     uint64_t benchStart = mach_absolute_time ();
     unsigned benchOk = 0;
-    for (unsigned i = 0; i < 128; ++i) {
+    for (unsigned i = 0; i < 512; ++i) {
       if (hostRead4k (kUserdataLun, benchLba + i * 32, 32, gScratch) == kIOReturnSuccess) ++benchOk;
     }
-    kprintf ("d144 bench n=128 ok=%u t0=%llx t1=%llx\n", benchOk, benchStart,
+    kprintf ("d144 bench n=512 ok=%u t0=%llx t1=%llx\n", benchOk, benchStart,
         mach_absolute_time ());
   }
   native_ufs_root_step = 3;
@@ -1401,6 +1514,20 @@ bool NativeUfs::startRoot (IOService *provider)
 #endif
   gStoreGeometry = { true, layout->userdataFirst, layout->userdataLast, layout->imageBytes, layout->gptEntriesLba,
                      layout->gptHeaderCrc, layout->gptEntriesCrc, layout->gptEntryCount };
+  {
+    // Persist the in-memory console ring from here on. load_init_program runs
+    // only after the root mount, minutes later, and a boot that dies before it
+    // would otherwise leave nothing behind for the next boot's prev| scan.
+    if (native_boot_log_start) native_boot_log_start ();
+    static bool heartbeatStarted = false;
+    if (!heartbeatStarted) {
+      heartbeatStarted = true;
+      thread_t heartbeat = NULL;
+      if (kernel_thread_start (displayHeartbeatThread, nullptr, &heartbeat) == KERN_SUCCESS) {
+        thread_deallocate (heartbeat);
+      }
+    }
+  }
   const char *names[4] = {};
   for (unsigned i = 0; i < layout->windows; ++i) names[i] = layout->window[i].name;
   if (!ufsBuildRootPlan (names, layout->windows, gPublicationPlan)) {

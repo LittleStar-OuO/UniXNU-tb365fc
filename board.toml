@@ -93,15 +93,16 @@ windows = [
 [payload]
 volume = "TB365FC"
 # boot_a is 64 MiB and LK loads the ramdisk at 0x66F00000 into the 64 MiB
-# "Boot Ramdisk" reservation, so the FAT payload must stay below both.
-size_mib = 56
+# "Boot Ramdisk" reservation, so the FAT payload must stay below both. The
+# GPU addon (compressed PanVK ICD dylib) needs the extra headroom.
+size_mib = 58
 loader = "firmware"
 title = "UniXNU"
 # native-4k-trust-cache is a bring-up accelerator: it skips the 3.4 GB
 # shared-cache hash pass (the SystemOS volume is owner-authorized read-only)
 # so a failed dyld map can be reproduced without a one-hour read. Remove it
 # once the userspace bring-up no longer needs the faster loop.
-kernel_args = ["-v", "serial=3", "debug=0x14e", "-enable_kprintf_spam", "sheng-pmgr=2", "native-ufs-root=1", "native-ufs-diagnostics=1", "native-4k-trust-cache=1", "offline-mobile-graphics-load=1", "offline-mobile-graphics-client=1", "offline-legacy-register=1", "offline-legacy-phase=4", "offline-legacy-gop=1", "offline-legacy-unit-scale=2", "offline-legacy-pm=1", "offline-legacy-validate=1", "offline-legacy-transfer=1", "offline-legacy-cpu-present=1", "sheng-log=1"]
+kernel_args = ["-v", "serial=3", "debug=0x14e", "-enable_kprintf_spam", "sheng-pmgr=2", "native-ufs-root=1", "native-ufs-diagnostics=1", "native-4k-trust-cache=1", "offline-mobile-graphics-load=1", "offline-mobile-graphics-client=1", "offline-legacy-register=1", "offline-legacy-phase=4", "offline-legacy-gop=1", "offline-legacy-unit-scale=2", "offline-legacy-pm=1", "offline-legacy-validate=1", "offline-legacy-transfer=1", "offline-legacy-cpu-present=1", "sheng-log=1", "native-mali-probe=1"]
 
 [payload.adt]
 # A stable software identity seed for this board, not an Apple silicon chip ID.
@@ -113,7 +114,7 @@ unique_chip_id = "required"
 root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"
 # Continuous DarwinBoot window, 512 MiB; the 128 MiB Data seed and the 73 MB
 # owner policy must both fit inside it. Accepted range is 256 MiB to 8 GiB.
-owned_memory_size = "0x20000000"
+owned_memory_size = "0x56600000"
 # The Data seed travels as a zero-page-packed DBRDISK1 image: keep it packed in
 # the ADT (PackedRAMDisk) and let NativeRamBlock parse the sparse seed in place,
 # as the official booted devices do. RAMDisk would require a dense expansion.

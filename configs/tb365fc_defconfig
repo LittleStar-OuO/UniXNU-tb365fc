@@ -29,6 +29,11 @@ CONFIG_XNU_OWNER_ROOT_TRUST=y
 # can open the shared cache; launchd then receives DYLD_SHARED_CACHE_DIR.
 CONFIG_XNU_OWNER_CACHE_MOUNT=y
 CONFIG_XNU_OWNER_CACHE_STARTUP=y
+CONFIG_XNU_OWNER_UNION_SYSTEMOS=y
+# iOS 17 keeps /usr/lib and the dyld cache inside the SystemOS cryptex.
+# Union-mount the verified SystemOS volume over "/" so dyld resolves
+# /usr/lib/libobjc-trampolines.dylib and the shared-cache directory,
+# instead of exposing the volume at /private/preboot alone.
 # The non-union owner mount puts the cache at /private/preboot, which the
 # stock shared-region setup rejects; the owner carrier authorizes exactly the
 # verified SystemOS volume and directory.
