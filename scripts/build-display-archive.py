@@ -328,6 +328,7 @@ def compile_probe(name):
     return OUT / (name[:-4] + '.o')
 hid_probe_obj = compile_probe('HidInputProbe.cpp')
 keystore_probe_obj = compile_probe('KeyStoreProbe.cpp')
+touch_res_obj = compile_probe('TouchResProbe.cpp')
 mali_source = ROOT / 'kits/tb365fc/NativeMali.cpp'
 require(mali_source.exists(), 'Missing kits/tb365fc/NativeMali.cpp')
 cmd = []
@@ -450,6 +451,7 @@ run([llvm_ar, 'rcs', archive, late, OUT / 'original-bindings.o', OUT / 'LegacyDi
      OUT / 'BootLog.o', mali_late, OUT / 'mali-accelerator-bindings.o',
      OUT / 'tb365fc-display-stubs.o', OUT / 'TB365FCProbeLaunch.o', gop_late,
      OUT / 'HidInputProbe.o', OUT / 'KeyStoreProbe.o',
+     OUT / 'TouchResProbe.o',
      hid_dir / 'NativeHidInput.late.o', hid_dir / 'hid-original-bindings.o', keyevents_late])
 report_sources = ['drivers/GopFramebuffer/NativeLegacyDisplay.cpp',
                   'drivers/GopFramebuffer/NativeGOPPresenter.cpp',
@@ -458,6 +460,7 @@ report_sources = ['drivers/GopFramebuffer/NativeLegacyDisplay.cpp',
                   'kits/tb365fc/NativeMali.cpp',
                   'kits/tb365fc/HidInputProbe.cpp',
                   'kits/tb365fc/KeyStoreProbe.cpp',
+                  'kits/tb365fc/TouchResProbe.cpp',
                   'kits/tb365fc/TB365FCProbeLaunch.c']
 (OUT / 'build-report.json').write_text(json.dumps(dict(
     source_sha256={name: sha(ROOT / name) for name in report_sources},
