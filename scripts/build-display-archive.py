@@ -114,6 +114,20 @@ for i in range(168, 358):
         header += f' virtual __attribute__((deprecated("Unclassified ABI: never call from source"))) void opaque{i}();\n'
 header += '};\nstatic_assert(sizeof(IOMobileFramebufferLegacy)==0x18a0,"Actual original instance extent");\n'
 (OUT / 'OriginalLegacyFramebufferABI.h').write_text(header)
+# The console overlay hook lives in the display copy path. A parent-side sync resets the
+# GopFramebuffer submodule to its pinned upstream commit, so inject the two lines here,
+# idempotently, right before the component builds.
+display_source = ROOT / 'drivers/GopFramebuffer/NativeLegacyDisplay.cpp'
+text = display_source.read_text()
+if 'native_console_overlay_refresh' not in text:
+    decl = 'extern "C" void native_legacy_swap_stage(unsigned);\n'
+    require(text.count(decl) == 1, 'display swap-stage declaration anchor')
+    text = text.replace(decl, decl + 'extern "C" void native_console_overlay_refresh(void);\n')
+    done = '        {uint64_t copyEnd;__asm__ volatile("isb\\n\\tmrs %0, cntpct_el0":"=r"(copyEnd));native_legacy_copy_timing_observed(copyEnd-copyStart,stored);}\n'
+    require(text.count(done) == 1, 'display copy completion anchor')
+    text = text.replace(done, '        native_console_overlay_refresh();\n' + done)
+    display_source.write_text(text)
+    print('injected the console overlay refresh into the display copy path')
 print(run(['python3', ROOT / 'scripts/build-arm-driver.py', 'NativeLegacyDisplay'], text=True), end='')
 obj = OUT / 'NativeLegacyDisplay.o'
 raw = obj.read_bytes()
@@ -405,6 +419,9 @@ volatile unsigned native_touch_seq, native_touch_count, native_touch_hid_reports
 volatile int native_touch_xs[12], native_touch_ys[12], native_touch_ids[12];
 void native_touch_set_sink(void (*sink)(void *), void *context) { (void)sink; (void)context; }
 void native_buttons_set_sink(void (*sink)(void *, unsigned int), void *context) { (void)sink; (void)context; }
+/* Present hook: the console bigtext patcher replaces this bare ret with a
+   branch to its refresh entry, so every presented frame keeps the log on top. */
+void native_console_overlay_refresh(void) {}
 ''')
 run([clang, '-target', 'arm64-apple-ios17.0', '-c', '-O2', '-ffreestanding', str(stub),
      '-o', str(OUT / 'tb365fc-display-stubs.o')])
