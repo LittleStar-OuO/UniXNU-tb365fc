@@ -78,6 +78,8 @@ void spinHalfClock(void) {
     } while (now - start < ticks);
 }
 
+static bool gSampleOnFalling;
+
 int busXfer(void *ctx, const uint8_t *tx, uint8_t *rx, size_t len) {
     Gpio *g = static_cast<Gpio *>(ctx);
     if (!tx) {
@@ -88,11 +90,20 @@ int busXfer(void *ctx, const uint8_t *tx, uint8_t *rx, size_t len) {
         uint8_t in = 0;
         for (int bit = 7; bit >= 0; bit--) {
             g->setOut(kMo, (tx[i] >> bit) & 1u);
-            spinHalfClock();
-            g->setOut(kClk, 1);
-            spinHalfClock();
-            in = (uint8_t)((in << 1) | g->getIn(kMi));
-            g->setOut(kClk, 0);
+            if (gSampleOnFalling) {
+                // Vendor tree sets spi-cpha: sample on the falling edge (mode 1).
+                g->setOut(kClk, 1);
+                spinHalfClock();
+                g->setOut(kClk, 0);
+                spinHalfClock();
+                in = (uint8_t)((in << 1) | g->getIn(kMi));
+            } else {
+                spinHalfClock();
+                g->setOut(kClk, 1);
+                spinHalfClock();
+                in = (uint8_t)((in << 1) | g->getIn(kMi));
+                g->setOut(kClk, 0);
+            }
         }
         if (rx) {
             rx[i] = in;
@@ -195,14 +206,28 @@ static void runIdentify(void) {
     }
     hardwareReset(&g);
     struct nvt_bus bus = { &g, busXfer, busDelay };
-    struct nvt_chip chip = {};
-    chip.bus = &bus;
-    chip.scratch = scratch;
-    chip.rxbuf = rxbuf;
-    int r = nvt_identify(&chip);
-    kprintf("tsp identify r=%d id=%02x %02x %02x %02x %02x %02x cas=%d map=%s\n", r,
-        chip.id[0], chip.id[1], chip.id[2], chip.id[3], chip.id[4], chip.id[5],
-        chip.cascade, chip.map ? chip.map->name : "-");
+    {
+        gSampleOnFalling = false;
+        struct nvt_chip chip = {};
+        chip.bus = &bus;
+        chip.scratch = scratch;
+        chip.rxbuf = rxbuf;
+        int r = nvt_identify(&chip);
+        kprintf("tsp id m0 r=%d id=%02x %02x %02x %02x %02x %02x\n", r,
+            chip.id[0], chip.id[1], chip.id[2], chip.id[3], chip.id[4], chip.id[5]);
+    }
+    hardwareReset(&g);
+    {
+        gSampleOnFalling = true;
+        struct nvt_chip chip = {};
+        chip.bus = &bus;
+        chip.scratch = scratch;
+        chip.rxbuf = rxbuf;
+        int r = nvt_identify(&chip);
+        kprintf("tsp id m1 r=%d id=%02x %02x %02x %02x %02x %02x cas=%d map=%s\n", r,
+            chip.id[0], chip.id[1], chip.id[2], chip.id[3], chip.id[4], chip.id[5],
+            chip.cascade, chip.map ? chip.map->name : "-");
+    }
     kprintf("tsp gpio after di=%x mi=%u\n", g.rd(0x200), g.getIn(kMi));
     IOFree(scratch, NVT_READ_MAX + 16);
     IOFree(rxbuf, NVT_READ_MAX + 16);
