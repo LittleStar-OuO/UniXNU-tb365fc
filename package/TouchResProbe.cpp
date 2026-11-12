@@ -68,7 +68,7 @@ void dumpAll(void) {
     {
         ResMap gpio;
         if (gpio.open(0x10005000ULL, 0x1000)) {
-            dumpWords("trs gpio", gpio.base, 0, 64);
+            dumpWords("trs gpio", gpio.base, 0, 32);
         } else {
             kprintf("trs gpio no map\n");
         }
@@ -138,5 +138,9 @@ extern "C" void native_touch_res_probe(void) {
     thread_t thread = nullptr;
     if (kernel_thread_start(delayedDump, (void *)(uintptr_t)delay, &thread) == KERN_SUCCESS) {
         thread_deallocate(thread);
+    }
+    thread_t again = nullptr;
+    if (kernel_thread_start(delayedDump, (void *)(uintptr_t)(delay + 360), &again) == KERN_SUCCESS) {
+        thread_deallocate(again);
     }
 }
