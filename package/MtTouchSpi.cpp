@@ -7,7 +7,9 @@
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
 #include <pexpert/pexpert.h>
+extern "C" {
 #include "nt36532/NvtProtocol.h"
+}
 
 namespace {
 
