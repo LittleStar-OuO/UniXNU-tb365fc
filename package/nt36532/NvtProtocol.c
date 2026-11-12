@@ -3,6 +3,7 @@
 // a1a6f2b1912b3cde2dcbe96439e5833b9ab250f4 (NvtProtocol.c).
 #include "NvtProtocol.h"
 extern void *memcpy(void *, const void *, unsigned long);
+extern int memcmp(const void *, const void *, unsigned long);
 extern void *memset(void *, int, unsigned long);
 
 #define EVENT_HOST_CMD 0x50
