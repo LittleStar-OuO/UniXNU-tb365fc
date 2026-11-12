@@ -6,6 +6,7 @@
 // 32-pin banks. Only the identify stage of the official protocol runs here.
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
+#include <kern/thread.h>
 #include <pexpert/pexpert.h>
 extern "C" {
 #include "nt36532/NvtProtocol.h"
@@ -111,13 +112,7 @@ void hardwareReset(Gpio *g) {
 
 }
 
-extern "C" void native_touch_spi_probe(void) {
-    unsigned stage = 0;
-    int found = PE_parse_boot_argn("touch", &stage, sizeof(stage));
-    kprintf("tsp enter found=%d stage=%u\n", found, stage);
-    if (!found || stage != 3) {
-        return;
-    }
+static void runIdentify(void) {
     Gpio g;
     if (!g.open()) {
         kprintf("tsp no gpio map\n");
@@ -163,4 +158,29 @@ extern "C" void native_touch_spi_probe(void) {
     IOFree(scratch, NVT_READ_MAX + 16);
     IOFree(rxbuf, NVT_READ_MAX + 16);
     g.close();
+}
+
+static void lateIdentify(void *arg, wait_result_t) {
+    unsigned seconds = (unsigned)(uintptr_t)arg;
+    IOSleep(seconds * 1000);
+    kprintf("tsp late +%us\n", seconds);
+    runIdentify();
+}
+
+extern "C" void native_touch_spi_probe(void) {
+    unsigned stage = 0;
+    int found = PE_parse_boot_argn("touch", &stage, sizeof(stage));
+    kprintf("tsp enter found=%d stage=%u\n", found, stage);
+    if (!found || stage != 3) {
+        return;
+    }
+    runIdentify();
+    thread_t t1 = nullptr;
+    if (kernel_thread_start(lateIdentify, (void *)(uintptr_t)360, &t1) == KERN_SUCCESS) {
+        thread_deallocate(t1);
+    }
+    thread_t t2 = nullptr;
+    if (kernel_thread_start(lateIdentify, (void *)(uintptr_t)420, &t2) == KERN_SUCCESS) {
+        thread_deallocate(t2);
+    }
 }
