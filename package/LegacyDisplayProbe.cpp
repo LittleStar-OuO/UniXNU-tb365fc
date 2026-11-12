@@ -474,6 +474,7 @@ void native_legacy_display_probe(void) {
 void native_legacy_display_late_probe(void);
 extern void native_keystore_probe(void);
 extern void native_touch_res_probe(void);
+extern void native_touch_spi_probe(void);
 extern void native_hid_input_probe(void);
 extern void native_virtio_input_probe(void);
 extern void native_shared_window_probe(void);
@@ -481,6 +482,7 @@ extern void native_qemu_metal_publish(void);
 void native_legacy_display_late_probe(void) {
     native_keystore_probe();
     native_touch_res_probe();
+    native_touch_spi_probe();
     native_hid_input_probe();
     native_virtio_input_probe();
     native_shared_window_probe();

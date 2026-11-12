@@ -329,6 +329,7 @@ def compile_probe(name):
 hid_probe_obj = compile_probe('HidInputProbe.cpp')
 keystore_probe_obj = compile_probe('KeyStoreProbe.cpp')
 touch_res_obj = compile_probe('TouchResProbe.cpp')
+touch_spi_obj = compile_probe('MtTouchSpi.cpp')
 mali_source = ROOT / 'kits/tb365fc/NativeMali.cpp'
 require(mali_source.exists(), 'Missing kits/tb365fc/NativeMali.cpp')
 cmd = []
@@ -439,6 +440,8 @@ require(code((gop / 'NativeGOPPresenter.o').read_bytes(), macho((gop / 'NativeGO
 print(run(['python3', ROOT / 'scripts/build-sheng-hid-input.py'], text=True), end='')
 print(run(['python3', ROOT / 'scripts/build-arm-driver.py', 'AppleKeyStoreState'], text=True), end='')
 hid_dir = ROOT / 'build/sheng-hid-input'
+run([clang, '-target', 'arm64-apple-ios17.0', '-O2', '-ffreestanding', '-I', str(ROOT / 'kits/tb365fc'),
+     '-c', str(ROOT / 'kits/tb365fc/nt36532/NvtProtocol.c'), '-o', str(OUT / 'NvtProtocol.o')])
 keyevents_dir = ROOT / 'build/apple-key-store-state'
 keyevents_late = keyevents_dir / 'NativeKeyStoreEvents.late.o'
 late_stage(keyevents_dir / 'NativeKeyStoreEvents.o', keyevents_late, '__GLOBAL__sub_I_NativeKeyStoreEvents.cpp')
@@ -451,7 +454,7 @@ run([llvm_ar, 'rcs', archive, late, OUT / 'original-bindings.o', OUT / 'LegacyDi
      OUT / 'BootLog.o', mali_late, OUT / 'mali-accelerator-bindings.o',
      OUT / 'tb365fc-display-stubs.o', OUT / 'TB365FCProbeLaunch.o', gop_late,
      OUT / 'HidInputProbe.o', OUT / 'KeyStoreProbe.o',
-     OUT / 'TouchResProbe.o',
+     OUT / 'TouchResProbe.o', OUT / 'MtTouchSpi.o', OUT / 'NvtProtocol.o',
      hid_dir / 'NativeHidInput.late.o', hid_dir / 'hid-original-bindings.o', keyevents_late])
 report_sources = ['drivers/GopFramebuffer/NativeLegacyDisplay.cpp',
                   'drivers/GopFramebuffer/NativeGOPPresenter.cpp',
@@ -461,6 +464,9 @@ report_sources = ['drivers/GopFramebuffer/NativeLegacyDisplay.cpp',
                   'kits/tb365fc/HidInputProbe.cpp',
                   'kits/tb365fc/KeyStoreProbe.cpp',
                   'kits/tb365fc/TouchResProbe.cpp',
+                  'kits/tb365fc/MtTouchSpi.cpp',
+                  'kits/tb365fc/nt36532/NvtProtocol.c',
+                  'kits/tb365fc/nt36532/NvtProtocol.h',
                   'kits/tb365fc/TB365FCProbeLaunch.c']
 (OUT / 'build-report.json').write_text(json.dumps(dict(
     source_sha256={name: sha(ROOT / name) for name in report_sources},
