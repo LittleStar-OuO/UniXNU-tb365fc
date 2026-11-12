@@ -119,6 +119,21 @@ static void runIdentify(void) {
         kprintf("tsp no gpio map\n");
         return;
     }
+    {
+        unsigned mBefore = g.rd(0x380);
+        g.wr(0x380, 0x00000000u);
+        unsigned mZero = g.rd(0x380);
+        g.wr(0x380, 0x5a5a5a5au);
+        unsigned mPat = g.rd(0x380);
+        g.wr(0x380, mBefore);
+        kprintf("tsp mode probe before=%x zero=%x pat=%x\n", mBefore, mZero, mPat);
+        kprintf("tsp scan300 %x %x %x %x %x %x %x %x\n",
+            g.rd(0x300), g.rd(0x310), g.rd(0x320), g.rd(0x330),
+            g.rd(0x340), g.rd(0x350), g.rd(0x360), g.rd(0x370));
+        kprintf("tsp scan380 %x %x %x %x %x %x %x %x\n",
+            g.rd(0x380), g.rd(0x390), g.rd(0x3a0), g.rd(0x3b0),
+            g.rd(0x3c0), g.rd(0x3d0), g.rd(0x3e0), g.rd(0x3f0));
+    }
     g.setMode(kClk, 0);
     g.setMode(kCs, 0);
     g.setMode(kMo, 0);
