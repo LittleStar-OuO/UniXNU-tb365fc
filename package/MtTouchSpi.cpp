@@ -21,8 +21,8 @@ struct Gpio {
     IOMemoryMap *map;
     volatile uint32_t *base;
 
-    bool open() {
-        desc = IOMemoryDescriptor::withPhysicalAddress(0x10005000ULL, 0x1000, kIODirectionNone);
+    bool openAt(uint64_t pa) {
+        desc = IOMemoryDescriptor::withPhysicalAddress(pa, 0x1000, kIODirectionNone);
         if (!desc) {
             return false;
         }
@@ -33,6 +33,7 @@ struct Gpio {
         base = reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress());
         return base != nullptr;
     }
+    bool open() { return openAt(0x10005000ULL); }
     void close() {
         if (map) {
             map->release();
@@ -132,6 +133,33 @@ static void runIdentify(void) {
     g.setOut(kCs, 1);
     g.setOut(kMo, 1);
     g.setOut(kRst, 1);
+    // The MTK iocfg banks hold the input-enable and schmitt fields; without
+    // them a GPIO input reads 0 forever. The pin-to-bank table is vendor data
+    // we do not have yet, so enable every input path once (inputs are read
+    // only; this cannot disturb other peripherals' outputs).
+    {
+        static const uint64_t banks[] = {
+            0x11b10000ULL, 0x11c40000ULL, 0x11d10000ULL, 0x11d30000ULL,
+            0x11d40000ULL, 0x11e30000ULL, 0x11eb0000ULL, 0x11ec0000ULL,
+        };
+        for (unsigned i = 0; i < sizeof(banks) / sizeof(banks[0]); i++) {
+            Gpio b;
+            if (!b.openAt(banks[i])) {
+                continue;
+            }
+            b.wr(0x000, 0xffffffffu);
+            b.wr(0x010, 0xffffffffu);
+            b.close();
+        }
+    }
+    g.setOut(kMo, 1);
+    busDelay(nullptr, 1);
+    unsigned miHigh = g.getIn(kMi);
+    g.setOut(kMo, 0);
+    busDelay(nullptr, 1);
+    unsigned miLow = g.getIn(kMi);
+    kprintf("tsp io mode380=%x m384=%x dir020=%x do120=%x di220=%x mi1=%u mi0=%u\n",
+        g.rd(0x380), g.rd(0x384), g.rd(0x020), g.rd(0x120), g.rd(0x220), miHigh, miLow);
     kprintf("tsp gpio mode300=%x m304=%x dir=%x do=%x di=%x mi=%u\n",
         g.rd(0x300), g.rd(0x304), g.rd(0x000), g.rd(0x100), g.rd(0x200), g.getIn(kMi));
 
