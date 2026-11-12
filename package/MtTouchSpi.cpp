@@ -135,10 +135,16 @@ static void runIdentify(void) {
             g.rd(0x3c0), g.rd(0x3d0), g.rd(0x3e0), g.rd(0x3f0));
     }
     g.setMode(kClk, 0);
-    g.setMode(kCs, 0);
-    g.setMode(kMo, 0);
-    g.setMode(kMi, 0);
-    g.setMode(kRst, 0);
+    unsigned mRmw = g.rd(0x380);
+    g.wr(0x380, 0x00000111u);
+    unsigned mWr = g.rd(0x380);
+    kprintf("tsp mode set rmw=%x wr=%x\n", mRmw, mWr);
+    g.wr(0x380, 0x00000000u);
+    {
+        unsigned w = g.rd(0x350);
+        w &= ~(0xFu << 12);
+        g.wr(0x350, w);
+    }
     g.setDirOut(kClk);
     g.setDirOut(kCs);
     g.setDirOut(kMo);
