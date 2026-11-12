@@ -114,8 +114,7 @@ void hardwareReset(Gpio *g) {
 extern "C" void native_touch_spi_probe(void) {
     unsigned stage = 0;
     int found = PE_parse_boot_argn("touch", &stage, sizeof(stage));
-    kprintf("tsp enter found=%d stage=%u
-", found, stage);
+    kprintf("tsp enter found=%d stage=%u\n", found, stage);
     if (!found || stage != 3) {
         return;
     }
