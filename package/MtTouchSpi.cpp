@@ -122,6 +122,32 @@ void hardwareReset(Gpio *g) {
     IOSleep(30);
 }
 
+unsigned pinWordBits(Gpio *g, unsigned pin) {
+    return (g->rd(0x100 + 0x10 * (pin / 32)) >> (pin % 32)) & 1u;
+}
+
+void pinMuxGpioWord(Gpio *g, unsigned pin) {
+    unsigned reg = 0x300 + 0x10 * (pin / 8);
+    unsigned shift = (pin % 8) * 4;
+    unsigned v = g->rd(reg);
+    v &= ~(0xFu << shift);
+    g->wr(reg, v);
+}
+
+// The NT36532 is the TDDI: the touch core is powered with the panel. The
+// stock panel node lists pm-enable 34 and bias 124/151; the display is already
+// running under the firmware framebuffer, so only those supplies are touched.
+// Reset (86) and backlight (21/25) stay untouched to keep the visible output.
+void panelPowerOn(Gpio *g) {
+    const unsigned pins[] = { 34, 124, 151 };
+    for (unsigned i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
+        pinMuxGpioWord(g, pins[i]);
+        g->setDirOut(pins[i]);
+        g->setOut(pins[i], 1);
+    }
+    busDelay(nullptr, 30);
+}
+
 }
 
 static void runIdentify(void) {
@@ -130,6 +156,12 @@ static void runIdentify(void) {
         kprintf("tsp no gpio map\n");
         return;
     }
+    kprintf("tsp pp do34=%u do21=%u do25=%u do86=%u do124=%u do151=%u\n",
+        pinWordBits(&g, 34), pinWordBits(&g, 21), pinWordBits(&g, 25),
+        pinWordBits(&g, 86), pinWordBits(&g, 124), pinWordBits(&g, 151));
+    panelPowerOn(&g);
+    kprintf("tsp pp on do34=%u do124=%u do151=%u\n",
+        pinWordBits(&g, 34), pinWordBits(&g, 124), pinWordBits(&g, 151));
     {
         unsigned mBefore = g.rd(0x380);
         g.wr(0x380, 0x00000000u);
