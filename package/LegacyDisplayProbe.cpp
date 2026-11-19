@@ -381,8 +381,19 @@ extern "C" unsigned native_legacy_clients_dump(char *out,unsigned cap) {
     }
     return at;
 }
-void native_legacy_client_observed(IOReturn status,IOUserClient *client) {
-    if(client && !status)interpose(client,native_legacy_client_pid);
+// Compact state dump for the console heartbeat: which gate of the display
+// bring-up was last crossed. stg==1/2 means the early probe stopped before
+// the service was staged; stg>=4 with nub=1 means the late probe published.
+extern "C" unsigned native_legacy_probe_dump(char *out,unsigned cap) {
+    unsigned at=0;out[0]=0;
+    at+=snprintf(out+at,cap-at,"stg=%u meta=%d init=%u nub=%u us=%d sf=%d/%u rel=%u pm=%u",
+        native_legacy_stage,native_legacy_meta_status,native_legacy_init_result,
+        native_legacy_nub?1u:0u,
+        native_legacy_unit_scale_status,native_legacy_surface_status,
+        native_legacy_surface_found,native_legacy_released,native_legacy_pm_stage);
+    return at;
+}
+void native_legacy_client_observed(IOReturn status,IOUserClient *client) {    if(client && !status)interpose(client,native_legacy_client_pid);
     native_legacy_client_status=status;native_legacy_client_object=(uintptr_t)client;
     if(client)strlcpy(native_legacy_client_class,client->getMetaClass()->getClassName(),sizeof(native_legacy_client_class));
     native_legacy_client_checkpoint();
@@ -476,6 +487,8 @@ extern void native_keystore_probe(void);
 extern void native_touch_res_probe(void);
 extern void native_touch_spi_probe(void);
 extern void native_hid_input_probe(void);
+extern void tb365fc_buttons_start(void);
+extern void tb365fc_touch_selftest_start(void);
 extern void native_virtio_input_probe(void);
 extern void native_shared_window_probe(void);
 extern void native_qemu_metal_publish(void);
@@ -484,6 +497,8 @@ void native_legacy_display_late_probe(void) {
     native_touch_res_probe();
     native_touch_spi_probe();
     native_hid_input_probe();
+    tb365fc_buttons_start();
+    tb365fc_touch_selftest_start();
     native_virtio_input_probe();
     native_shared_window_probe();
     native_qemu_metal_publish();

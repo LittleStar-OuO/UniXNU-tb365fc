@@ -330,6 +330,12 @@ hid_probe_obj = compile_probe('HidInputProbe.cpp')
 keystore_probe_obj = compile_probe('KeyStoreProbe.cpp')
 touch_res_obj = compile_probe('TouchResProbe.cpp')
 touch_spi_obj = compile_probe('MtTouchSpi.cpp')
+# Board input: the shared finger set the HID device publishes, the MT6377/KPD
+# button reader, and the synthetic touch frame source used to qualify the HID
+# chain before the Himax firmware runs.
+touch_state_obj = compile_probe('TouchState.cpp')
+buttons_obj = compile_probe('MtButtons.cpp')
+touch_selftest_obj = compile_probe('TouchSelfTest.cpp')
 mali_source = ROOT / 'kits/tb365fc/NativeMali.cpp'
 require(mali_source.exists(), 'Missing kits/tb365fc/NativeMali.cpp')
 cmd = []
@@ -414,13 +420,9 @@ void boot_progress_stage(const char *message) { (void)message; }
 int boot_progress_pulse_anchor(unsigned long anchor, unsigned long long length,
                                unsigned width, unsigned height, unsigned stride)
 { (void)anchor; (void)length; (void)width; (void)height; (void)stride; return 0; }
-/* The sheng touch core (ShengNovatekTouch + QcomGeniSpi) and the button
-   driver are not part of this MTK board's stack yet; the offline HID source
-   only needs their sink hooks and published counters. */
-volatile unsigned native_touch_seq, native_touch_count, native_touch_hid_reports;
-volatile int native_touch_xs[12], native_touch_ys[12], native_touch_ids[12];
-void native_touch_set_sink(void (*sink)(void *), void *context) { (void)sink; (void)context; }
-void native_buttons_set_sink(void (*sink)(void *, unsigned int), void *context) { (void)sink; (void)context; }
+/* The board input sources (kits/tb365fc/TouchState.cpp and MtButtons.cpp)
+   define the finger-set sink and the button sink; only the board providers
+   this MTK stack does not have are stubbed here. */
 /* Present hook: the console bigtext patcher replaces this bare ret with a
    branch to its refresh entry, so every presented frame keeps the log on top. */
 void native_console_overlay_refresh(void) {}
@@ -455,6 +457,7 @@ run([llvm_ar, 'rcs', archive, late, OUT / 'original-bindings.o', OUT / 'LegacyDi
      OUT / 'tb365fc-display-stubs.o', OUT / 'TB365FCProbeLaunch.o', gop_late,
      OUT / 'HidInputProbe.o', OUT / 'KeyStoreProbe.o',
      OUT / 'TouchResProbe.o', OUT / 'MtTouchSpi.o', OUT / 'NvtProtocol.o',
+     OUT / 'TouchState.o', OUT / 'MtButtons.o', OUT / 'TouchSelfTest.o',
      hid_dir / 'NativeHidInput.late.o', hid_dir / 'hid-original-bindings.o', keyevents_late])
 report_sources = ['drivers/GopFramebuffer/NativeLegacyDisplay.cpp',
                   'drivers/GopFramebuffer/NativeGOPPresenter.cpp',
@@ -465,6 +468,9 @@ report_sources = ['drivers/GopFramebuffer/NativeLegacyDisplay.cpp',
                   'kits/tb365fc/KeyStoreProbe.cpp',
                   'kits/tb365fc/TouchResProbe.cpp',
                   'kits/tb365fc/MtTouchSpi.cpp',
+                  'kits/tb365fc/TouchState.cpp',
+                  'kits/tb365fc/MtButtons.cpp',
+                  'kits/tb365fc/TouchSelfTest.cpp',
                   'kits/tb365fc/nt36532/NvtProtocol.c',
                   'kits/tb365fc/nt36532/NvtProtocol.h',
                   'kits/tb365fc/TB365FCProbeLaunch.c']

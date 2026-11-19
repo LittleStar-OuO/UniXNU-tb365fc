@@ -73,6 +73,10 @@ volatile uint32_t native_ufs_integrity_failures = 0;
 
 // BootLog lives in the legacy display late archive; boards without it skip the call.
 extern "C" void native_boot_log_start (void) __attribute__((weak_import));
+// Display bring-up gate dump from the legacy display archive.
+extern "C" unsigned native_legacy_probe_dump (char *, unsigned) __attribute__((weak_import));
+// ZF firmware download phase, likewise.
+extern "C" unsigned tb365fc_zf_dump (char *, unsigned) __attribute__((weak_import));
 
 // The legacy display probe records the client and presentation state; this
 // heartbeat brings those counters to the console while the UI does not show.
@@ -81,12 +85,18 @@ static void displayHeartbeatThread (void *, wait_result_t)
   for (;;) {
     IOSleep (20000);
     if (&::native_legacy_client_status == nullptr) continue;
-    kprintf ("lfp c=%d pid=%d pc=%u pf=%u rg=%u pg=%u rf=%u ts=%x cls=%s\n",
+    char dg[96];
+    dg[0] = 0;
+    if (native_legacy_probe_dump) native_legacy_probe_dump (dg, sizeof dg);
+    char zf[224];
+    zf[0] = 0;
+    if (tb365fc_zf_dump) tb365fc_zf_dump (zf, sizeof zf);
+    kprintf ("lfp c=%d pid=%d pc=%u pf=%u rg=%u pg=%u rf=%u ts=%x cls=%s %s %s\n",
         ::native_legacy_client_status, ::native_legacy_client_pid,
         ::native_legacy_prepare_calls, ::native_legacy_prepare_failures,
         ::native_legacy_retired_generation, ::native_legacy_presented_generation,
         ::native_legacy_retired_frames, static_cast<uint32_t> (::native_legacy_transfer_status),
-        static_cast<const char *> (::native_legacy_client_class) ? ::native_legacy_client_class : "?");
+        static_cast<const char *> (::native_legacy_client_class) ? ::native_legacy_client_class : "?", dg, zf);
   }
 }
 
@@ -1129,12 +1139,25 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
     }
   } operations = { windowLock, buffer, this };
   UfsWindowResult outcome = ufsReadWindow (operations, absolute, bytes, block, count, bounce);
+  for (unsigned attempt = 0; attempt < 5 && outcome.status != kIOReturnSuccess; attempt++) {
+    // Transient transport errors must not take the system down. The window
+    // read is idempotent and still verified per block, so retry with a short
+    // settle before deciding it is a real fault.
+    IOSleep (5);
+    outcome = ufsReadWindow (operations, absolute, bytes, block, count, bounce);
+  }
   IOReturn result = outcome.status;
   uint64_t done = outcome.done;
   if (result != kIOReturnSuccess) {
     __atomic_fetch_add (&native_ufs_block_failures, 1, __ATOMIC_RELAXED);
     gRootDiagnostic.result = static_cast<uint32_t> (result);
-    rootDiagnosticFailure ("root window read failed");
+    // Bring-up: a persistent media error fails the read instead of panicking.
+    // The read never returns unverified data on failure, so the trust
+    // property is preserved; the caller gets kIOReturnIOError.
+    if (!native_ufs_root_failure) {
+      native_ufs_root_failure = "root window read failed";
+      kprintf ("NativeUfs: window read failed st=%x\n", static_cast<unsigned> (result));
+    }
   }
   completion->action (completion->target, completion->parameter, result, done);
   return kIOReturnSuccess;

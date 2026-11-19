@@ -1,0 +1,1 @@
+51bb3e3cab4f5b7be9d4342cdb8dd37d4454a1fb0c24c460a753e26fafc8468c  hxchipset.ko
