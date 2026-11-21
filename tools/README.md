@@ -1,57 +1,55 @@
-# Hardware collection and image unpacking
+# 硬件取证与镜像解包工具
 
-These scripts turn the TB365FC stock firmware into the values the device and
-firmware repositories still mark `REQUIRED`. They are read-only with respect
-to the tablet, apart from writing to the local output directory.
+**English edition: [README.en.md](README.en.md)**
 
-Requirements: `bash`, `adb` with USB debugging, `python3`; `dtc`
-(`device-tree-compiler`) is optional and only used to decompile blobs.
+这些脚本把 TB365FC 原厂固件转化为设备/固件仓库所需的测量值。除写入本地输出目录外，
+对平板本身均为只读操作。
 
-## 1. Inventory the running tablet
+依赖：`bash`、带 USB 调试的 `adb`、`python3`；`dtc`（device-tree-compiler）可选，
+仅在反编译 blob 时使用。
+
+## 1. 盘点运行中的平板
 
 ```bash
 ./collect-device-info.sh -o out/inv
 ```
 
-Writes `build-identity.txt`, filtered `getprop`, `/proc/cmdline`,
-`/proc/cpuinfo`, `/proc/meminfo`, `/proc/partitions`, `block-by-name.txt`,
-`block-queue.txt` (size and logical block size per device), `boot-devices.txt`,
-`wm-size.txt`, `wm-density.txt` and, with root, `/proc/iomem`, the live FDT
-(`fdt.dtb`) and the top-level DT node list. Serial, IMEI/MEID, MAC and Android ID lines are filtered from
-`props-filtered.txt`; identifier values in `cmdline.txt` and `bootconfig.txt`
-and the `Serial` line of `cpuinfo.txt` are redacted; `--dmesg` additionally
-saves a filtered kernel log. `fdt.dtb` can still embed MAC or serial
-properties, so review it before sharing.
+输出 `build-identity.txt`、过滤后的 `getprop`、`/proc/cmdline`、`/proc/cpuinfo`、
+`/proc/meminfo`、`/proc/partitions`、`block-by-name.txt`、`block-queue.txt`
+（每个设备的大小与逻辑块大小）、`boot-devices.txt`、`wm-size.txt`、`wm-density.txt`；
+有 root 时另存 `/proc/iomem`、live FDT（`fdt.dtb`）与顶层 DT 节点列表。
+序列号、IMEI/MEID、MAC 与 Android ID 行会从 `props-filtered.txt` 过滤；
+`cmdline.txt`、`bootconfig.txt` 中的标识值与 `cpuinfo.txt` 的 `Serial` 行会被遮蔽；
+加 `--dmesg` 还会保存过滤后的内核日志。`fdt.dtb` 仍可能含 MAC/序列号属性，
+分享前请人工复核。
 
-Use `build-identity.txt` to confirm the board (`ro.product.device`,
-`ro.board.platform`, `ro.boot.hardware`, `ro.boot.hardware.sku`) matches
-`cava_prc_consumer_wifi` / MT6835.
+用 `build-identity.txt` 确认板型（`ro.product.device`、`ro.board.platform`、
+`ro.boot.hardware`、`ro.boot.hardware.sku`）匹配 `cava_prc_consumer_wifi` / MT6835。
 
-## 2. Pull the stock boot images
+## 2. 拉取原厂启动镜像
 
 ```bash
 ./pull-stock-images.sh -o out/stock
-# or a specific set:
+# 或指定集合：
 ./pull-stock-images.sh -o out/stock boot vendor_boot dtbo
 ```
 
-Root is required. The script refuses `persist`, `nvram`, `modem*`, `fsg`,
-`fsc`, `radio`, `metadata`, `userdata` and `super`. Files are named after the
-partition (`boot_a.img` when a slot suffix is active).
+需要 root。脚本拒绝 `persist`、`nvram`、`modem*`、`fsg`、`fsc`、`radio`、
+`metadata`、`userdata` 与 `super`。文件按分区命名（有活动槽位后缀时为
+`boot_a.img` 等）。
 
-If the official firmware package is a zip with `payload.bin`, extract the
-same images on a host instead:
+如果官方固件包是带 `payload.bin` 的 zip，可在主机侧提取：
 
 ```bash
-# payload.bin from the OTA/factory package
+# 来自 OTA/工厂包的 payload.bin
 payload-dumper-go -o out/stock payload.bin
-# or, from a super image
+# 或从 super 镜像：
 lpunpack --slot=0 super.img out/stock
 ```
 
-A QFIL/SP Flash Tool package already contains the partition `.img` files.
+QFIL/SP Flash Tool 包本身已包含各分区 `.img`。
 
-## 3. Read the boot header
+## 3. 读取 boot 头
 
 ```bash
 python3 unpack_boot_image.py out/stock/boot_a.img
@@ -60,27 +58,25 @@ python3 unpack_boot_image.py out/stock/boot_a.img --extract out/stock/unpacked
 python3 unpack_boot_image.py out/stock/vendor_boot_a.img --extract out/stock/unpacked
 ```
 
-Supported: boot header v0-v4 (`ANDROID!`) and vendor_boot v3/v4
-(`VNDRBOOT`). The header dump gives:
+支持：boot 头 v0–v4（`ANDROID!`）与 vendor_boot v3/v4（`VNDRBOOT`）。头部字段去向：
 
-| Field | Goes to |
+| 字段 | 去向 |
 | --- | --- |
-| `kernel_addr`, `pagesize`, `header_version` | `Resources/Configs/tb365fc.toml` |
-| `tags_addr`, `ramdisk_addr` | `tags_offset`, `ramdisk_offset` |
+| `kernel_addr`、`pagesize`、`header_version` | `Resources/Configs/tb365fc.toml` |
+| `tags_addr`、`ramdisk_addr` | `tags_offset`、`ramdisk_offset` |
 | `cmdline` | `[boot_image] cmdline` |
-| `dtb_size`, `dtb_addr` | `dtb_offset` (v2 images) |
+| `dtb_size`、`dtb_addr` | `dtb_offset`（v2 镜像） |
 
-For v0-v2 the boot image base is `kernel_addr - kernel_offset`; keep
-`kernel_offset` at `0x8000` unless the stock image proves a different value.
-Note that `./unixnu bootimg` passes only `base`, `kernel_offset`, `tags_offset`,
-`pagesize`, `header_version`, `ramdisk_offset`, `second_offset` and `cmdline`
-to mkbootimg and ignores `dtb`/`dtb_offset`: it appends the compiled DTB to the
-gzipped kernel and takes the blob from `--dtb` on the command line. `dtb` and
-`dtb_offset` only matter to the standalone `build_uefi.py` reference path.
-v3/v4 boot images carry no load addresses, so the FD base cannot be derived
-from them: use the LK/fastboot log or Plan B.
+v0–v2 的 boot 基址为 `kernel_addr - kernel_offset`；除原厂镜像另有证明，
+`kernel_offset` 保持 `0x8000`。注意 `./unixnu bootimg` 只把 `base`、
+`kernel_offset`、`tags_offset`、`pagesize`、`header_version`、`ramdisk_offset`、
+`second_offset` 与 `cmdline` 传给 mkbootimg，忽略 `dtb`/`dtb_offset`：
+它把编译出的 DTB 追加在 gzip 内核之后，blob 取自命令行的 `--dtb`。
+`dtb`/`dtb_offset` 仅对独立 `build_uefi.py` 参考路径有意义。
+v3/v4 boot 镜像不携带加载地址，无法据此推导 FD 基址：使用 LK/fastboot
+日志或 Plan B。
 
-## 4. Extract the stock device tree
+## 4. 提取原厂设备树
 
 ```bash
 python3 extract_fdt.py out/stock/dtbo_a.img -o out/stock/fdt --dtc
@@ -88,32 +84,27 @@ python3 extract_fdt.py out/stock/vendor_boot_a.img -o out/stock/fdt --dtc
 python3 extract_fdt.py out/stock/dtb_a.img --raw-scan -o out/stock/fdt --dtc
 ```
 
-Handles a single DTB, a DTBO table, a vendor_boot DTB (including a DTBO
-container inside it) and raw partitions with concatenated trees. Every blob
-is written as `<name>-NN.dtb`; `--dtc` also writes `<name>-NN.dts`.
+支持单个 DTB、DTBO 表、vendor_boot DTB（含内部 DTBO 容器）以及拼接多棵树的
+原始分区。每个 blob 写成 `<name>-NN.dtb`；`--dtc` 同时写出 `<name>-NN.dts`。
 
-Diff the decompiled trees against the skeletons:
+与骨架树对比：
 
 ```bash
 diff -u ../../UniXNU-mt6835-common/dts/mt6835.dtsi out/stock/fdt/vendor_boot_a-00.dts
 ```
 
-Record in `porting.toml` (areas `cpu`, `memory`, `display`, `storage`,
-`power`): the file name, the command, the observed node/property and the
-resulting change; then update the DTS and the firmware values.
+在 `porting.toml`（areas：`cpu`、`memory`、`display`、`storage`、`power`）
+记录：文件名、命令、观察到的节点/属性及最终改动；随后更新 DTS 与固件值。
 
-## 5. Record the evidence
+## 5. 记录证据
 
-- `proprietary-files.txt` gets one SHA-256 and source partition per file;
-  never commit the image itself.
-- `porting.toml` findings should quote the command and the relevant header
-  line, e.g. `unpack_boot_image.py boot_a.img` → `kernel_addr 0x40080000`.
-- Keep `example = true` in `board.toml` until every `REQUIRED` value has a
-  recorded measurement and the firmware has booted on the tablet.
+- `proprietary-files.txt` 每个文件记录一条 SHA-256 与来源分区；**不要**提交镜像本体。
+- `porting.toml` 的发现应引用命令与关键头部行，例如
+  `unpack_boot_image.py boot_a.img` → `kernel_addr 0x40080000`。
+- 在全部 `REQUIRED` 值有测量记录且固件已在平板上启动前，`board.toml` 保持
+  `example = true`。
 
-## Privacy
+## 隐私
 
-Stock boot images contain vendor code; `persist`/`modem*`/`nvram` contain
-calibration and identifiers. Neither belongs in a public repository. The
-device inventory scripts filter obvious identifiers, but review every file
-before committing it.
+原厂启动镜像含厂商代码；`persist`/`modem*`/`nvram` 含校准数据与标识信息，
+均不应进入公开仓库。设备盘点脚本会过滤明显标识，但提交前请复核每个文件。
