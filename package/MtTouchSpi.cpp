@@ -73,12 +73,14 @@ struct Gpio {
 };
 
 static unsigned gHalfClockScale = 1;
+static unsigned gHalfTicks;      // direct half-period override (CNTFRQ ticks)
 
 void spinHalfClock(void) {
     uint64_t freq = 0, start = 0, now = 0;
     __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
     __asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(start));
-    uint64_t ticks = (freq / 2000000u) * gHalfClockScale;   // ~500 kHz / scale
+    uint64_t ticks = gHalfTicks ? gHalfTicks
+        : (freq / 2000000u) * gHalfClockScale;   // ~500 kHz / scale
     if (!ticks) {
         ticks = 1;
     }
@@ -96,6 +98,7 @@ unsigned clockTicks(void) {
 
 static unsigned gCpol, gCpha;   // SPI mode under test
 static unsigned gRxAt;           // 0 first edge (legacy), 1 fall edge, 2 fall edge plus spin
+static unsigned gShift = 23;     // reply stream offset in frame bits (probed at boot)
 static unsigned gMiOnes;        // MISO samples seen high, i.e. wire activity
 static unsigned gXferN;         // transfers issued in the current attempt
 static bool gTrace;             // print the first transfers of the attempt
@@ -130,8 +133,12 @@ static uint32_t gSpi[40];         // SPI3 hardware-controller probe words
 static uint8_t gHid[8];          // Himax pipe 0xD0 read over the hardware SPI
 static uint8_t gRb[12];          // raw rx bytes of the 0x13 and 0x0D readback
 static uint8_t gPipeRaw[8];      // un-realigned rx bytes of the last pipe read
-static unsigned gTlm[16];        // last touch-loop telemetry, printed in the summary
+static volatile unsigned gTlm[16];   // last touch-loop telemetry, printed in the summary
+static volatile unsigned gTkCnt;     // completed telemetry ticks
+static volatile unsigned gAb[6];     // 0x90060000 probe: {sumA,sumB,sumC, cc, cC, firstA}
+static volatile unsigned gRnz;       // main-loop stack reads that were non-zero
 static unsigned gT2;             // one-shot post-boot register experiments
+static unsigned gIntEdges;       // GPIO4 transitions seen by the touch loop
 static uint8_t gEq[4];           // 0x90000048 after the reload-to-active command
 static unsigned gEqN;            // reload-to-active polls
 static uint8_t gFs[4][4];        // fw status after reload: 0x10007000, 0x10007004, 0x10007010, 0x90000018
@@ -139,7 +146,12 @@ static unsigned gDw[24];         // fw download tallies
 static uint8_t gDrb[16];         // flash readback at 0 after the download
 static uint8_t gDr2[16];         // flash readback at 0x1000 after the download
 
+static int (*gHwXfer)(const uint8_t *, uint8_t *, unsigned);
+
 int busXfer(void *ctx, const uint8_t *tx, uint8_t *rx, size_t len) {
+    if (gHwXfer) {
+        return gHwXfer(tx, rx, (unsigned)len);
+    }
     Gpio *g = static_cast<Gpio *>(ctx);
     if (!tx) {
         return -1;
@@ -480,7 +492,7 @@ static void hxRegRead(Gpio *g, uint32_t addr, uint8_t *out, unsigned len) {
     for (unsigned i = 0; i < len; i++) {
         unsigned b = 0;
         for (unsigned k = 0; k < 8; k++) {
-            unsigned pos = (i * 8 + k) + 23;
+            unsigned pos = (i * 8 + k) + gShift;
             b = (b << 1) | ((rx[pos >> 3] >> (7 - (pos & 7))) & 1u);
         }
         out[i] = (uint8_t)b;
@@ -506,7 +518,7 @@ static void hxRegReadN(Gpio *g, uint32_t addr, uint8_t *out, unsigned len) {
     for (unsigned i = 0; i < len; i++) {
         unsigned b = 0;
         for (unsigned k = 0; k < 8; k++) {
-            unsigned pos = (i * 8 + k) + 23;
+            unsigned pos = (i * 8 + k) + gShift;
             b = (b << 1) | ((rx[pos >> 3] >> (7 - (pos & 7))) & 1u);
         }
         out[i] = (uint8_t)b;
@@ -988,6 +1000,10 @@ static uint8_t gPat8k[8192];
 static unsigned gR[8];           // ISRAM/DSRAM 8K probe buckets
 static volatile bool gZfDone;
 static volatile unsigned gTxFrames, gTxReports, gTxLastN, gTxSink;
+static volatile unsigned gLab1[9];   // fw_ver,cfg,vendor,cus,proj,fw_state,dbg,mode488,psl
+static volatile unsigned gLab2[8];   // pre/re-arm stack poll counts
+static volatile unsigned gLab4[8];   // stylus regs, DSRAM window dwords at tick
+static volatile unsigned gLab5[8];   // live DSRAM sweep stats at tick
 
 static uint32_t zfWord(unsigned index, unsigned field) {
     const uint8_t *r = gFwImg + 0x20500u + index * 16u + field * 4u;
@@ -1303,19 +1319,100 @@ static void runZfDownload(void) {
     }
     gZfPhase = 15;
     kprintf("zf wf c6=%04x\n", c6);
+
+    // Vendor tail after the update: _reload_disable(0) then a second full
+    // power_on_init. Clearing 0x10000100 back to the reload-enable value and
+    // re-running sense_on is what the stock driver does before the FW scans.
+    unsigned reload2 = 0, c62 = 0, rl2Ok = 0, rl2N = 0, rs2Ok = 0, rs2N = 0;
+    if (reload) {
+        hxRegWriteU32(&g, 0x10000100u, 0x00000000u);
+        hxRegWriteU32(&g, 0x100006ECu, 0x00000000u);
+        hxRegWriteU32(&g, 0x10000104u, 0x00000000u);
+        hxRegWriteU32(&g, 0x10000694u, 0x00000001u);
+        hxRegWriteU32(&g, 0x100006C0u, 0x00000000u);
+        hxRegWriteU32(&g, 0x9000005Cu, 0x00000000u);
+        busDelay(nullptr, 10);
+        // ux2/xun sense_on order: whole-chip PIN reset (RST low 5 ms, high
+        // 5 ms) so the TDDI TCON/AFE restart too, then reload to active.
+        g.setOut(kRst, 0);
+        busDelay(nullptr, 5000);
+        g.setOut(kRst, 1);
+        busDelay(nullptr, 5000);
+        rs2Ok = 2;
+        rs2N = 1;
+        hxCmd(&g, 0x13, 0x31);
+        hxCmd(&g, 0x0D, 0x10);
+        {
+            uint8_t v[4] = { 0, 0, 0, 0 };
+            for (rl2N = 1; rl2N <= 20; rl2N++) {
+                hxRegWriteU32(&g, 0x90000048u, 0x000000ECu);
+                busDelay(nullptr, 1);
+                hxRegRead(&g, 0x90000048u, v, 4);
+                if (v[0] == 0xEC && v[1] == 0x01) {
+                    rl2Ok = 1;
+                    break;
+                }
+            }
+        }
+        if (!rl2Ok) {
+            // Fall back to the vendor cmd reset (password pulses).
+            for (unsigned i = 0; i < 6; i++) {
+                uint8_t off[4] = { 0xF2, 0x31, 0x27, 0x95 };
+                busXfer(&g, off, nullptr, 4);
+                busDelay(nullptr, 20);
+                uint8_t off0[3] = { 0xF2, 0x31, 0x00 };
+                busXfer(&g, off0, nullptr, 3);
+                busDelay(nullptr, 10);
+                uint8_t fe[4] = { 0, 0, 0, 0 };
+                hxRegRead(&g, 0x900000E4u, fe, 4);
+                rs2N = i + 1;
+                if (fe[0] == 0x00 && fe[1] == 0x02) {
+                    rs2Ok = 1;
+                    break;
+                }
+            }
+            hxCmd(&g, 0x13, 0x31);
+            hxCmd(&g, 0x0D, 0x10);
+            {
+                uint8_t v[4] = { 0, 0, 0, 0 };
+                for (rl2N = 1; rl2N <= 20; rl2N++) {
+                    hxRegWriteU32(&g, 0x90000048u, 0x000000ECu);
+                    busDelay(nullptr, 1);
+                    hxRegRead(&g, 0x90000048u, v, 4);
+                    if (v[0] == 0xEC && v[1] == 0x01) {
+                        rl2Ok = 1;
+                        break;
+                    }
+                }
+            }
+        }
+        {
+            uint8_t v[4] = { 0, 0, 0, 0 };
+            for (unsigned i = 0; i < 30; i++) {
+                hxRegRead(&g, 0x100006C0u, v, 4);
+                c62 = (unsigned)v[0] | ((unsigned)v[1] << 8);
+                if (v[0] == 0xC0 && v[1] == 0x72 && v[2] == 0 && v[3] == 0) {
+                    reload2 = 1;
+                    break;
+                }
+                IOSleep(10);
+            }
+        }
+        kprintf("zf wf2 rs=%u/%u rl=%u/%u c6=%04x\n", rs2Ok, rs2N, rl2Ok, rl2N, c62);
+        gZf[18] = rs2Ok ? (rs2N | 0x100u) : rs2N;
+        gZf[19] = (rl2Ok ? 0x100u : 0) | rl2N;
+        gZf[20] = (reload2 ? 0x10000u : 0) | c62;
+        if (reload2) {
+            c6 = c62;
+            reload = 2;
+        }
+    }
     gZf[17] = hxReadU32(&g, 0x900000A8u);
     gZfPhase = 16;
     kprintf("zf wg a8=%08x\n", gZf[17]);
     gZf[21] = hxReadU32(&g, 0x10007000u);
     gZfPhase = 17;
     kprintf("zf wh h=%08x\n", gZf[21]);
-    zfWrite(&g, 0x20000000u, gFwImg + 0x25000, 0x1000);
-    gP[4] = zfCompare(&g, 0x20000000u, gFwImg + 0x25000, 0x1000, 256);
-    gP[5] = gZfFirst;
-    zfWrite(&g, 0x10000F00u, gFwImg + 0x25000, 0x1000);
-    gP[6] = zfCompare(&g, 0x10000F00u, gFwImg + 0x25000, 0x1000, 256);
-    gP[7] = gZfFirst;
-    kprintf("zf wi post is=%u/%x f0=%u/%x\n", gP[4], gP[5], gP[6], gP[7]);
     gZf[5] = reload;
     gZf[6] = c6;
     gZfPhase = 18;
@@ -1363,7 +1460,7 @@ static void hxPipeRead(Gpio *g, uint8_t pipe, uint8_t *out, unsigned len) {
     for (unsigned i = 0; i < len; i++) {
         unsigned b = 0;
         for (unsigned k = 0; k < 8; k++) {
-            unsigned pos = (i * 8 + k) + 23;
+            unsigned pos = (i * 8 + k) + gShift;
             b = (b << 1) | ((rx[pos >> 3] >> (7 - (pos & 7))) & 1u);
         }
         out[i] = (uint8_t)b;
@@ -1387,6 +1484,8 @@ static void mapPoint(unsigned rotate, unsigned x, unsigned y, int *dx, int *dy) 
     *dy = (int)((unsigned long long)b * 20320u / spanY);
 }
 
+static void hwProbe(void);
+
 static void himaxTouchThread(void *, wait_result_t) {
     for (unsigned i = 0; i < 120 && !gZfDone; i++) {
         IOSleep(1000);
@@ -1409,16 +1508,56 @@ static void himaxTouchThread(void *, wait_result_t) {
     gCpha = 0;
 
     uint8_t v[4] = { 0, 0, 0, 0 };
+    // Stock DTS: spi-cpha, driver forces SPI_MODE_3. Probe (CPOL/CPHA,
+    // sampling position, reply shift) until the FW handshake reads C0 72.
+    unsigned md = 0;
+    {
+        uint8_t t[4] = { 0, 0, 0, 0 };
+        static const unsigned cps[2][2] = { { 0, 0 }, { 1, 1 } };
+        static const unsigned ats[3] = { 0, 1, 2 };
+        for (unsigned m = 0; m < 2 && !md; m++) {
+            for (unsigned a = 0; a < 3 && !md; a++) {
+                for (unsigned sh = 23; sh <= 24 && !md; sh++) {
+                    gCpol = cps[m][0];
+                    gCpha = cps[m][1];
+                    gRxAt = ats[a];
+                    gShift = sh;
+                    hxRegRead(&g, 0x100006C0u, t, 4);
+                    if (t[0] == 0xC0 && t[1] == 0x72) {
+                        md = 1 + m * 10 + a * 2 + (sh - 23);
+                    }
+                }
+                if (!md) {
+                    gShift = 23;
+                }
+            }
+        }
+        if (!md) {
+            gCpol = 0;
+            gCpha = 0;
+            gRxAt = 0;
+            gShift = 23;
+        }
+        kprintf("TSP md m=%u\n", md);
+    }
     unsigned up = 0;
     // The vendor power_on_init polls this register for the reload-done
     // signature after the IC reset; 0x72C0 is the only proof the FW runs.
-    for (unsigned i = 0; i < 60; i++) {
+    for (unsigned i = 0; i < 10; i++) {
         hxRegRead(&g, 0x100006C0u, v, 4);
         if (v[0] == 0xC0 && v[1] == 0x72) {
             up = 1;
             break;
         }
-        busDelay(nullptr, 1000);
+        busDelay(nullptr, 2000);
+    }
+    if (!up) {
+        uint8_t a8p[4] = { 0, 0, 0, 0 }, ptp[4] = { 0, 0, 0, 0 };
+        hxRegRead(&g, 0x900000A8u, a8p, 4);
+        hxRegRead(&g, 0x100004F8u, ptp, 4);
+        if (a8p[0] == 0x05 || ptp[0] == 10) {
+            up = 2;
+        }
     }
     if (!up) {
         uint8_t a8[4] = { 0, 0, 0, 0 }, f0[4] = { 0, 0, 0, 0 }, f4[4] = { 0, 0, 0, 0 };
@@ -1436,18 +1575,7 @@ static void himaxTouchThread(void *, wait_result_t) {
         // Keep watching the event stack without publishing: if a stock FW is
         // alive the count byte moves on touch and the gTx counters carry that
         // into the heartbeat line.
-        for (unsigned frames = 0;; frames++) {
-            uint8_t buf[128];
-            hxPipeRead(&g, 0x30, buf, 128);
-            gTxFrames = frames + 1;
-            gTxLastN = buf[40];
-            gTxSink = native_touch_sink_ready;
-            if (frames < 3) {
-                kprintf("TSP tx f=%u cb=%02x raw=%02x%02x%02x%02x\n",
-                    frames, buf[40], buf[0], buf[1], buf[2], buf[3]);
-            }
-            IOSleep(20);
-        }
+        kprintf("TSP tx nh fallthrough\n");
     }
     hxRegRead(&g, 0x100004F8u, v, 4);
     unsigned maxPt = v[0] ? v[0] : 10;
@@ -1459,37 +1587,182 @@ static void himaxTouchThread(void *, wait_result_t) {
     gTxSink = native_touch_sink_ready;
     kprintf("TSP tx up maxpt=%u rot=%u sink=%u\n", maxPt, rotate & 3u, native_touch_sink_ready);
 
+    hwProbe();
+
+    // diag334: the stack is FW-fed, so the slow 500 kHz bit clock may be
+    // outside its service window. Raise the clock while proving register
+    // round-trips still work, then run the stack tests at that speed.
+    {
+        static const unsigned ladder[3] = { 6, 8, 4 };
+        unsigned ok = 0, used = 0;
+        for (unsigned s = 0; s < 3 && !ok; s++) {
+            gHalfTicks = ladder[s];
+            uint8_t pat[4] = { 0x5A, 0xA5, 0x3C, 0xC3 };
+            uint8_t rb[4] = { 0, 0, 0, 0 };
+            hxRegWrite(&g, 0x20000040u, pat, 4);
+            hxRegReadN(&g, 0x20000040u, rb, 4);
+            ok = rb[0] == 0x5A && rb[1] == 0xA5 && rb[2] == 0x3C && rb[3] == 0xC3;
+            used = gHalfTicks;
+        }
+        if (!ok) {
+            gHalfTicks = 0;
+        }
+        gTlm[5] = gHalfTicks;
+        kprintf("TSP hs t=%u ok=%u\n", used, ok);
+    }
+
+    // diag331: pristine one-shot stack snapshots. Nothing touches pipe 0x30
+    // before these reads; each snapshot samples the INT pin first, then pops
+    // exactly one frame, so the first-ever stack access of the boot is clean.
+    {
+        gLab1[0] = hxReadU32(&g, 0x10000404u);   // fw_ver
+        gLab1[1] = hxReadU32(&g, 0x10000484u);   // fw_cfg
+        gLab1[2] = hxReadU32(&g, 0x10000400u);   // fw_vendor
+        gLab1[3] = hxReadU32(&g, 0x10000408u);   // cus_info
+        gLab1[4] = hxReadU32(&g, 0x10000414u);   // proj_info
+        gLab1[5] = hxReadU32(&g, 0x900000F8u);   // fw_state
+        gLab1[6] = hxReadU32(&g, 0x10000140u);   // fw_dbg_msg
+        gLab1[7] = hxReadU32(&g, 0x10000488u);   // fw_mode_status/chk_irq_edge
+        gLab1[8] = hxReadU32(&g, 0x900000A0u);   // psl
+        gLab4[0] = hxReadU32(&g, 0x1000059Cu);   // info_def_stylus
+        static const unsigned waits[4] = { 0, 5000, 15000, 25000 };
+        for (unsigned dsm = 0; dsm < 4; dsm++) {
+            if (waits[dsm]) {
+                IOSleep(waits[dsm]);
+            }
+            unsigned lo = 0;
+            for (unsigned t = 0; t < 200; t++) {
+                if (!g.getIn(4)) {
+                    lo++;
+                }
+            }
+            uint8_t b[68];
+            hxPipeRead(&g, 0x30, b, 68);
+            unsigned sum = 0, nz = 0;
+            for (unsigned k = 0; k < 68; k++) {
+                sum += b[k];
+                if (b[k]) {
+                    nz++;
+                }
+            }
+            unsigned w0 = ((unsigned)b[0] << 24) | ((unsigned)b[1] << 16) |
+                ((unsigned)b[2] << 8) | b[3];
+            unsigned w1 = ((unsigned)b[4] << 24) | ((unsigned)b[5] << 16) |
+                ((unsigned)b[6] << 8) | b[7];
+            gLab2[dsm] = w0;
+            gLab4[1 + dsm] = nz | (lo << 8);
+            kprintf("TSP os%u w=%08x%08x sum=%u nz=%u lo=%u\n",
+                dsm, w0, w1, sum, nz, lo);
+        }
+        gLab4[5] = hxReadU32(&g, 0x10000700u);
+        gT2 = 1;
+        gTlm[11] = 1;
+    }
+
+    g.setMode(4, 0);
+    g.setDirIn(4);
     int ids[10], xs[10], ys[10];
     unsigned frames = 0, reports = 0, contacts = 0;
-    const unsigned infoSize = (maxPt + maxPt / 4 + 2) * 4;
+    static unsigned lastInt;
+    lastInt = g.getIn(4);
+    {
+        // One-shot read-latency probe plus breadcrumbs.
+        uint64_t t0 = 0, t1 = 0;
+        uint8_t lv[4] = { 0, 0, 0, 0 };
+        __asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(t0));
+        hxRegRead(&g, 0x900000A8u, lv, 4);
+        __asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(t1));
+        uint64_t tf = 0;
+        __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(tf));
+        kprintf("TSP ml t=%u/%u a8=%02x\n",
+            tf ? (unsigned)((t1 - t0) * 1000000u / tf) : 0u, (unsigned)(t1 - t0), lv[0]);
+    }
+    const unsigned stylus = (hxReadU32(&g, 0x1000059Cu) >> 24) & 0xFFu;
+    const unsigned infoSize = stylus ? 68u : 56u;
+    kprintf("TSP sz styl=%u len=%u\n", stylus, infoSize);
     bool down = false;
+    lastInt = g.getIn(4);
     for (;;) {
         uint8_t buf[128];
-        hxPipeRead(&g, 0x30, buf, infoSize);
-        {
+        for (unsigned k = 0; k < 128; k++) {
+            buf[k] = 0;
+        }
+        // IRQ-gated pop: read one frame only while the INT pin is asserted
+        // (active low), the way the vendor handler consumes the stack,
+        // instead of hammering it between events.
+        unsigned lvl = g.getIn(4);
+        if (lvl != lastInt) {
+            lastInt = lvl;
+            gIntEdges++;
+        }
+        bool popped = false;
+        if (lvl == 0) {
             unsigned s0 = 0;
+            hxPipeRead(&g, 0x30, buf, infoSize);
+            popped = true;
             for (unsigned k = 0; k < infoSize; k++) {
                 s0 += buf[k];
             }
             if (!s0) {
-                hxPipeRead(&g, 0x30, buf, infoSize);
+                // diag333: the stack pipe yields all-zero frames, so also
+                // fetch the DSRAM event window and use it when it carries data.
+                uint8_t db[68];
+                hxRegReadN(&g, 0x10000700u, db, 68);
+                unsigned s1 = 0;
+                for (unsigned k = 0; k < 68; k++) {
+                    s1 += db[k];
+                    buf[k] = db[k];
+                }
+                if (s1) {
+                    gRnz++;
+                }
+            } else {
+                gRnz++;
             }
+        } else {
+            busDelay(nullptr, 500);
         }
-        // Vendor himax_parse_report_data: the byte after the coordinate block
-        // is the point count in its low nibble; 0xFF and 0 mean "no contact".
+        // Mainline hx83112b/hx83102J event layout: the frame sums to 0 mod
+        // 256, point count sits at len-16 (0xFF = none), x/y big endian.
+        unsigned cks = 0;
+        for (unsigned k = 0; k < infoSize; k++) {
+            cks += buf[k];
+        }
         unsigned count = 0;
-        const uint8_t countByte = buf[maxPt * 4];
-        if (countByte != 0xFF) {
-            count = countByte & 0x0Fu;
+        const uint8_t countByte = buf[infoSize - 16];
+        if ((cks & 0xFF) == 0 && countByte != 0xFF) {
+            const unsigned c = countByte & 0x0Fu;
+            count = c <= maxPt ? c : 0;
         }
-        if (count > maxPt) {
-            count = maxPt;
+        // First frame that passes the full event validation: dump the raw 56
+        // bytes once so the layout can be confirmed against the mainline one.
+        static unsigned evDumped;
+        if (!evDumped && (cks & 0xFF) == 0 && count > 0) {
+            evDumped = 1;
+            kprintf("TSP ev0 %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                (unsigned)buf[0] | ((unsigned)buf[1] << 8) | ((unsigned)buf[2] << 16) | ((unsigned)buf[3] << 24),
+                (unsigned)buf[4] | ((unsigned)buf[5] << 8) | ((unsigned)buf[6] << 16) | ((unsigned)buf[7] << 24),
+                (unsigned)buf[8] | ((unsigned)buf[9] << 8) | ((unsigned)buf[10] << 16) | ((unsigned)buf[11] << 24),
+                (unsigned)buf[12] | ((unsigned)buf[13] << 8) | ((unsigned)buf[14] << 16) | ((unsigned)buf[15] << 24),
+                (unsigned)buf[16] | ((unsigned)buf[17] << 8) | ((unsigned)buf[18] << 16) | ((unsigned)buf[19] << 24),
+                (unsigned)buf[20] | ((unsigned)buf[21] << 8) | ((unsigned)buf[22] << 16) | ((unsigned)buf[23] << 24),
+                (unsigned)buf[24] | ((unsigned)buf[25] << 8) | ((unsigned)buf[26] << 16) | ((unsigned)buf[27] << 24),
+                (unsigned)buf[28] | ((unsigned)buf[29] << 8) | ((unsigned)buf[30] << 16) | ((unsigned)buf[31] << 24),
+                (unsigned)buf[32] | ((unsigned)buf[33] << 8) | ((unsigned)buf[34] << 16) | ((unsigned)buf[35] << 24),
+                (unsigned)buf[36] | ((unsigned)buf[37] << 8) | ((unsigned)buf[38] << 16) | ((unsigned)buf[39] << 24),
+                (unsigned)buf[40] | ((unsigned)buf[41] << 8) | ((unsigned)buf[42] << 16) | ((unsigned)buf[43] << 24),
+                (unsigned)buf[44] | ((unsigned)buf[45] << 8) | ((unsigned)buf[46] << 16) | ((unsigned)buf[47] << 24),
+                (unsigned)buf[48] | ((unsigned)buf[49] << 8) | ((unsigned)buf[50] << 16) | ((unsigned)buf[51] << 24),
+                (unsigned)buf[52] | ((unsigned)buf[53] << 8) | ((unsigned)buf[54] << 16) | ((unsigned)buf[55] << 24),
+                (unsigned)buf[56] | ((unsigned)buf[57] << 8) | ((unsigned)buf[58] << 16) | ((unsigned)buf[59] << 24),
+                (unsigned)buf[60] | ((unsigned)buf[61] << 8) | ((unsigned)buf[62] << 16) | ((unsigned)buf[63] << 24));
         }
         unsigned n = 0;
         for (unsigned i = 0; i < count; i++) {
             const unsigned x = ((unsigned)buf[i * 4] << 8) | buf[i * 4 + 1];
             const unsigned y = ((unsigned)buf[i * 4 + 2] << 8) | buf[i * 4 + 3];
-            if (x == 0 || y == 0 || x > 16000u || y > 25600u) {
+            if (x == 0 || y == 0 || x == 0xFFFFu || y == 0xFFFFu ||
+                x > 16000u || y > 25600u) {
                 continue;
             }
             ids[n] = (int)i;
@@ -1503,7 +1776,7 @@ static void himaxTouchThread(void *, wait_result_t) {
                 contacts++;
                 down = true;
             }
-        } else if (down) {
+        } else if (down && popped) {
             native_touch_publish(0, ids, xs, ys);
             reports++;
             down = false;
@@ -1518,7 +1791,12 @@ static void himaxTouchThread(void *, wait_result_t) {
         gTxReports = reports;
         gTxLastN = n;
         gTxSink = native_touch_sink_ready;
-        if ((frames % 2000) == 0) {
+        static unsigned tickAcc;
+        if (++tickAcc >= 2000) {
+            tickAcc = 0;
+            gTkCnt++;
+            gTlm[0] = frames;
+            kprintf("TSP tk f=%u\n", frames);
             uint8_t ch[4] = { 0, 0, 0, 0 }, pt[4] = { 0, 0, 0, 0 }, ie[4] = { 0, 0, 0, 0 };
             uint8_t mk[4] = { 0, 0, 0, 0 }, a8[4] = { 0, 0, 0, 0 }, f0[4] = { 0, 0, 0, 0 };
             uint8_t id[4] = { 0, 0, 0, 0 }, buf2[128];
@@ -1550,9 +1828,10 @@ static void himaxTouchThread(void *, wait_result_t) {
             // Fast burst: the stack may be a mailbox that empties quickly.
             unsigned nz = 0, maxSum = 0, firstW = 0, firstW2 = 0, excB = 0;
             unsigned cbW = 0, cbW2 = 0;
+            unsigned edges = gIntEdges;
             {
-                uint8_t b3[64];
-                for (unsigned i = 0; i < 200; i++) {
+                uint8_t b3[128];
+                for (unsigned i = 0; i < 50; i++) {
                     hxPipeRead(&g, 0x30, b3, infoSize);
                     unsigned s = 0;
                     bool same = true;
@@ -1585,33 +1864,112 @@ static void himaxTouchThread(void *, wait_result_t) {
                     }
                 }
             }
-            // Pipe sweep: find any pipe that returns non-zero bytes, in case
-            // this FW parks reports outside the configured event stack.
-            unsigned bestPipe = 0xFF, bestSum = 0;
+            // diag333: live sweep of the candidate DSRAM event windows, so a
+            // real touch moves these statistics in the printed summary.
             {
-                uint8_t b3[16];
-                for (unsigned p = 0; p < 0x80; p++) {
-                    hxPipeRead(&g, (uint8_t)p, b3, 8);
-                    unsigned s = 0;
-                    for (unsigned k = 0; k < 8; k++) {
-                        s += b3[k];
+                uint8_t w7[64];
+                unsigned tnz = 0, td0 = 0, td1 = 0;
+                for (unsigned c = 0; c < 3; c++) {
+                    unsigned chunk = c < 2 ? 64u : 52u;
+                    hxRegReadN(&g, 0x10000700u + c * 64u, w7, chunk);
+                    for (unsigned k = 0; k < chunk; k++) {
+                        if (w7[k]) {
+                            tnz++;
+                        }
                     }
-                    if (s > bestSum) {
-                        bestSum = s;
-                        bestPipe = p;
-                    }
-                }
-                for (unsigned p = 0xD0; p < 0xE0; p++) {
-                    hxPipeRead(&g, (uint8_t)p, b3, 8);
-                    unsigned s = 0;
-                    for (unsigned k = 0; k < 8; k++) {
-                        s += b3[k];
-                    }
-                    if (s > bestSum) {
-                        bestSum = s;
-                        bestPipe = p;
+                    if (c == 0) {
+                        td0 = ((unsigned)w7[0] << 24) | ((unsigned)w7[1] << 16) |
+                            ((unsigned)w7[2] << 8) | w7[3];
+                        td1 = ((unsigned)w7[4] << 24) | ((unsigned)w7[5] << 16) |
+                            ((unsigned)w7[6] << 8) | w7[7];
                     }
                 }
+                gLab5[0] = tnz;
+                gLab5[1] = td0;
+                gLab5[2] = td1;
+                uint8_t w6[16];
+                hxRegReadN(&g, 0x100006F0u, w6, 16);
+                unsigned n6 = 0;
+                for (unsigned k = 0; k < 16; k++) {
+                    if (w6[k]) {
+                        n6++;
+                    }
+                }
+                gLab5[3] = n6;
+                gLab5[4] = ((unsigned)w6[0] << 24) | ((unsigned)w6[1] << 16) |
+                    ((unsigned)w6[2] << 8) | w6[3];
+                uint8_t wa3[32];
+                hxRegReadN(&g, 0x10000A00u, wa3, 32);
+                unsigned na = 0;
+                for (unsigned k = 0; k < 32; k++) {
+                    if (wa3[k]) {
+                        na++;
+                    }
+                }
+                gLab5[5] = na;
+                gLab5[6] = ((unsigned)wa3[0] << 24) | ((unsigned)wa3[1] << 16) |
+                    ((unsigned)wa3[2] << 8) | wa3[3];
+            }
+            unsigned bestPipe = 0xFF, bestSum = 0;
+            // Three-window probe of the 0x90060000 buffer: 0x00/0x40/0x80.
+            {
+                uint8_t wq[64];
+                hxRegReadN(&g, 0x90060000u, wq, 56);
+                unsigned sA = 0;
+                for (unsigned i = 0; i < 56; i++) {
+                    sA += wq[i];
+                }
+                unsigned cA = wq[52];
+                unsigned kA = (sA & 0xFF) == 0 ? 1u : 0u;
+                gAb[5] = ((unsigned)wq[0] << 24) | ((unsigned)wq[1] << 16) |
+                    ((unsigned)wq[2] << 8) | wq[3];
+                hxRegReadN(&g, 0x90060040u, wq, 56);
+                unsigned sB = 0;
+                for (unsigned i = 0; i < 56; i++) {
+                    sB += wq[i];
+                }
+                unsigned cB = wq[52];
+                unsigned kB = (sB & 0xFF) == 0 ? 1u : 0u;
+                hxRegReadN(&g, 0x90060080u, wq, 56);
+                unsigned sC = 0;
+                for (unsigned i = 0; i < 56; i++) {
+                    sC += wq[i];
+                }
+                unsigned cC = wq[52];
+                unsigned kC = (sC & 0xFF) == 0 ? 1u : 0u;
+                gAb[0] = sA;
+                gAb[1] = sB;
+                gAb[2] = sC;
+                gAb[3] = (cA & 0xFF) | ((kA & 1u) << 8) | (((cB & 0xFF) | ((kB & 1u) << 8)) << 16);
+                gAb[4] = cC | ((kC & 1u) << 8);
+            }
+            // Variant A: HX83100-official path, AHB window at 0x90060000.
+            unsigned sumA = 0, firstA = 0;
+            {
+                uint8_t wa[128];
+                hxCmd(&g, 0x13, 0x31);
+                hxCmd(&g, 0x0D, 0x10);
+                hxRegReadN(&g, 0x90060000u, wa, infoSize);
+                for (unsigned i = 0; i < infoSize; i++) {
+                    sumA += wa[i];
+                }
+                firstA = ((unsigned)wa[0] << 24) | ((unsigned)wa[1] << 16) |
+                    ((unsigned)wa[2] << 8) | wa[3];
+            }
+            // Variant B: HX83112 path, burst off, pipe 0x30, burst on.
+            unsigned sumB = 0, firstB = 0;
+            {
+                uint8_t wb[128];
+                hxCmd(&g, 0x13, 0x00);
+                hxCmd(&g, 0x0D, 0x00);
+                hxPipeRead(&g, 0x30, wb, infoSize);
+                hxCmd(&g, 0x13, 0x31);
+                hxCmd(&g, 0x0D, 0x10);
+                for (unsigned i = 0; i < infoSize; i++) {
+                    sumB += wb[i];
+                }
+                firstB = ((unsigned)wb[0] << 24) | ((unsigned)wb[1] << 16) |
+                    ((unsigned)wb[2] << 8) | wb[3];
             }
             // One-shot post-boot experiments from the vendor table: idle
             // disable (para 0x17 -> 0x10000488), PSL reset (0x900000A0), and
@@ -1686,10 +2044,13 @@ static void himaxTouchThread(void *, wait_result_t) {
             gTlm[13] = firstW;
             gTlm[14] = firstW2;
             gTlm[15] = excB;
-            gTlm[8] = mk[0];
             gTlm[9] = i1;
             gTlm[10] = cbW;
-            gTlm[12] = cbW2;
+            gTlm[12] = edges;
+            gTlm[5] = gCpol | (gCpha << 1) | (gRxAt << 2) | (gShift << 4);
+            gTlm[13] = (sumA << 16) | (firstA & 0xFFFFu);
+            gTlm[14] = (sumB << 16) | (firstB & 0xFFFFu);
+            gTlm[15] = firstA;
             kprintf("TSP tq f=%u cb=%02x sm=%u/%u a8=%02x kh=%03x a8h=%08x rx=%u tx=%u pt=%u i1=%u\n",
                 frames, count, sum, sum2, a8[0], gTlm[11], gTlm[12], ch[2], ch[3], pt[0], i1);
             kprintf("TSP tq2 raw=%02x%02x%02x%02x%02x%02x%02x%02x b=%02x%02x%02x%02x%02x%02x%02x%02x f0=%02x%02x%02x%02x\n",
@@ -2154,6 +2515,68 @@ static int s3transfer(const uint8_t *tx, uint8_t *rx, unsigned length) {
     return 0;
 }
 
+static volatile unsigned gHwDone;
+static void hwProbe(void) {
+    if (gHwDone) {
+        return;
+    }
+    gHwDone = 1;
+    vm_offset_t base = ml_io_map(0x11013000ULL, 0x1000);
+    vm_offset_t inf = ml_io_map(0x10001000ULL, 0x1000);
+    if (!base || !inf) {
+        kprintf("TSP hw nomap\n");
+        return;
+    }
+    s3 = reinterpret_cast<volatile uint32_t *>(base);
+    volatile uint32_t *inao = reinterpret_cast<volatile uint32_t *>(inf);
+    Gpio g;
+    if (!g.open()) {
+        kprintf("TSP hw nogpio\n");
+        return;
+    }
+    unsigned modeBefore = g.rd(0x380);
+    unsigned gateBefore = inao[0xa8 / 4];
+    unsigned id0 = s3rd(0x00), st0 = s3rd(0x20);
+    // ruby (ruby-ios-bringup/touch): the SPI3 gate is active-low; writing the
+    // bit to the CLR register at INFRA_AO+0xa8 enables the clock.
+    inao[0xa8 / 4] = 1u << 10;
+    IODelay(5);
+    unsigned gateAfter = inao[0xa8 / 4];
+    unsigned id1 = s3rd(0x00), st1 = s3rd(0x20);
+    // Pads 68..71 -> SPI3 function 2 (stock DTS: 0x4402 0x4502 0x4602 0x4702).
+    g.wr(0x380, (modeBefore & 0x0000ffffu) | 0x22220000u);
+    IODelay(2);
+    unsigned modeAfter = g.rd(0x380);
+    s3cmd = s3rd(0x18) & ~((1u << 7) | (1u << 6));
+    s3wr(0x00, 0x003f003fu);
+    s3wr(0x04, 63);
+    s3wr(0x28, 0x001f001fu);
+    s3wr(0x24, 1);
+    s3wr(0x18, s3cmd);
+    unsigned rb = 0, c6 = 0, ok = 0;
+    gHwXfer = s3transfer;
+    {
+        uint8_t pat[4] = { 0x5A, 0xA5, 0x3C, 0xC3 }, got[4] = { 0, 0, 0, 0 };
+        hxRegWrite(&g, 0x20000040u, pat, 4);
+        hxRegReadN(&g, 0x20000040u, got, 4);
+        rb = (unsigned)got[0] | ((unsigned)got[1] << 8) | ((unsigned)got[2] << 16) |
+            ((unsigned)got[3] << 24);
+        uint8_t c[4] = { 0, 0, 0, 0 };
+        hxRegRead(&g, 0x100006C0u, c, 4);
+        c6 = ((unsigned)c[0] << 8) | c[1];
+        ok = (c[0] == 0xC0 && c[1] == 0x72) ? 1u : 0u;
+    }
+    gHwXfer = nullptr;
+    // Hand the pads back to GPIO mode for the proven bit-banged path.
+    g.wr(0x380, modeBefore);
+    g.setDirOut(kCs);
+    g.setOut(kCs, 1);
+    g.close();
+    gTlm[6] = ok;
+    kprintf("TSP hw g=%08x/%08x s=%08x/%08x id=%08x/%08x p=%08x rb=%08x c6=%04x ok=%u\n",
+        gateBefore, gateAfter, st0, st1, id0, id1, modeAfter, rb, c6, ok);
+}
+
 static void runSpiHimax(void) {
     Gpio g;
     vm_offset_t base = ml_io_map(0x11013000ULL, 0x1000);
@@ -2543,12 +2966,24 @@ static void printSummary(unsigned) {
         kprintf("TSP zf2 pn=%u fs=%u cs=%u fw=%08x cf=%08x rl=%u c6=%04x up=%u ra=%x/%04x\n",
             gZf[0], gZf[1], gZf[2], gZf[3], gZf[4], gZf[5], gZf[6], gZf[7],
             gZf[22], gZf[23]);
-        kprintf("TSP tq f=%u cb=%02x a8=%02x fb=%u/%u ev=%03x f8=%08x,%08x c8=%08x,%08x\n",
-            gTlm[0], gTlm[1], gTlm[4],
-            gTlm[7] & 0xFFFFu, gTlm[7] >> 16, gTlm[15], gTlm[13], gTlm[14], gTlm[10], gTlm[12]);
-        kprintf("TSP st ph=%u fw=%08x cf=%08x rl=%u c6=%04x up=%u st=%04x mp=%u tx=%u/%u n=%u s=%u %s\n",
+        kprintf("TSP tq f=%u cb=%02x a8=%02x ie=%u m=%02x fb=%u/%u f8=%08x\n",
+            gTlm[0], gTlm[1], gTlm[4], gTlm[12], gTlm[5],
+            gTlm[7] & 0xFFFFu, gTlm[7] >> 16, gTlm[15]);
+        kprintf("TSP ab s=%u/%u/%u c=%02x/%02x k=%u/%u c3=%02x k3=%u f8=%08x\n",
+            gAb[0], gAb[1], gAb[2], gAb[3] & 0xFF, (gAb[3] >> 16) & 0xFF,
+            (gAb[3] >> 8) & 1u, (gAb[3] >> 24) & 1u, gAb[4] & 0xFF, (gAb[4] >> 8) & 1u, gAb[5]);
+        kprintf("TSP lab1 v=%08x cf=%08x vd=%08x cu=%08x pr=%08x fs=%08x dm=%08x me=%08x psl=%08x\n",
+            gLab1[0], gLab1[1], gLab1[2], gLab1[3], gLab1[4], gLab1[5],
+            gLab1[6], gLab1[7], gLab1[8]);
+        kprintf("TSP lab2 s=%08x/%08x/%08x/%08x\n",
+            gLab2[0], gLab2[1], gLab2[2], gLab2[3]);
+        kprintf("TSP lab4 nz=%u/%u/%u/%u lo=%u/%u/%u/%u d7=%08x\n",
+            gLab4[1] & 0xFF, gLab4[2] & 0xFF, gLab4[3] & 0xFF, gLab4[4] & 0xFF,
+            gLab4[1] >> 8, gLab4[2] >> 8, gLab4[3] >> 8, gLab4[4] >> 8,
+            gLab4[5]);
+        kprintf("TSP st ph=%u fw=%08x cf=%08x rl=%u c6=%04x up=%u st=%04x mp=%u tx=%u/%u n=%u s=%u tk=%u nz=%u %s\n",
             gZfPhase, gZf[3], gZf[4], gZf[5], gZf[6], gZf[7], gZf[9], gZf[10],
-            gTxFrames, gTxReports, gTxLastN, gTxSink, dg);
+            gTxFrames, gTxReports, gTxLastN, gTxSink, gTkCnt, gRnz, dg);
     }
 }
 
